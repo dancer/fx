@@ -10,6 +10,7 @@ const login_flow = @import("login_flow.zig");
 const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
+const windows_console = @import("../../ui/terminal/windows_console.zig");
 
 const Allocator = std.mem.Allocator;
 const FormBody = oauth.FormBody;
@@ -389,6 +390,15 @@ const StdinManualCodeReader = struct {
 
     fn poll(self: *StdinManualCodeReader) !?[]const u8 {
         if (self.closed) return null;
+        if (comptime host_target.is_windows) {
+            const line_len = windows_console.readQueuedLine(self.buffer[self.len..]) catch |err| switch (err) {
+                error.LineTooLong => return error.GrokAuthorizationCodeTooLong,
+                else => return err,
+            } orelse return null;
+            self.len += line_len;
+            self.closed = true;
+            return self.buffer[0..self.len];
+        }
         var fds = [_]std.posix.pollfd{.{
             .fd = std.posix.STDIN_FILENO,
             .events = std.posix.POLL.IN,

@@ -10,6 +10,7 @@ const cursor_probe = @import("terminal/cursor_probe.zig");
 const resize_runtime = @import("resize_runtime.zig");
 const ui_terminal = @import("terminal/terminal.zig");
 const wasm_terminal = if (builtin.os.tag == .wasi) @import("terminal/wasm_terminal.zig") else struct {};
+const windows_console = @import("terminal/windows_console.zig");
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -35,7 +36,7 @@ extern "c" fn unlockpt(fd: c_int) c_int;
 extern "c" fn ptsname(fd: c_int) ?[*:0]u8;
 
 pub const supports_resize_signal = resize_runtime.supports_resize_signal;
-pub const ResizeHandler = if (builtin.os.tag == .wasi)
+pub const ResizeHandler = if (builtin.os.tag == .wasi or builtin.os.tag == .windows)
     *const fn () callconv(.c) void
 else
     std.posix.Sigaction.handler_fn;
@@ -62,8 +63,11 @@ pub const AlternateScreenOwner = enum {
 };
 
 pub const TerminalState = struct {
-    stdin_fd: std.posix.fd_t = std.posix.STDIN_FILENO,
+    /// Windows has no comptime stdin descriptor; windows_console resolves the
+    /// console handles itself when each call is made.
+    stdin_fd: std.posix.fd_t = if (builtin.os.tag == .windows) std.os.windows.INVALID_HANDLE_VALUE else std.posix.STDIN_FILENO,
     original_termios: std.posix.termios = undefined,
+    original_console: if (builtin.os.tag == .windows) windows_console.Modes else void = if (builtin.os.tag == .windows) .{} else {},
     raw_enabled: bool = false,
     alternate_screen_owner: AlternateScreenOwner = .none,
     alternate_frame_layout: frame_layout.CommittedLayoutSnapshot = .{},
@@ -85,6 +89,10 @@ pub const TerminalState = struct {
 
     pub fn ensureInteractive(self: TerminalState) !void {
         if (comptime builtin.os.tag == .wasi) return;
+        if (comptime builtin.os.tag == .windows) {
+            if (!windows_console.isInteractive()) return error.NotATerminal;
+            return;
+        }
         if (std.c.isatty(self.stdin_fd) == 0 or std.c.isatty(std.posix.STDOUT_FILENO) == 0) {
             return error.NotATerminal;
         }
@@ -92,11 +100,20 @@ pub const TerminalState = struct {
 
     pub fn captureOriginalTermios(self: *TerminalState) !void {
         if (comptime builtin.os.tag == .wasi) return;
+        if (comptime builtin.os.tag == .windows) {
+            self.original_console = try windows_console.captureModes();
+            return;
+        }
         self.original_termios = try std.posix.tcgetattr(self.stdin_fd);
     }
 
     pub fn enableRawMode(self: *TerminalState) !void {
         if (comptime builtin.os.tag == .wasi) {
+            self.raw_enabled = true;
+            return;
+        }
+        if (comptime builtin.os.tag == .windows) {
+            try windows_console.enableRawMode(self.original_console);
             self.raw_enabled = true;
             return;
         }
@@ -131,8 +148,10 @@ pub const TerminalState = struct {
 
     pub fn disableRawMode(self: *TerminalState) void {
         if (!self.raw_enabled) return;
-        if (comptime builtin.os.tag != .wasi) {
-            std.posix.tcsetattr(self.stdin_fd, .FLUSH, self.original_termios) catch {};
+        switch (comptime builtin.os.tag) {
+            .wasi => {},
+            .windows => windows_console.restoreModes(self.original_console),
+            else => std.posix.tcsetattr(self.stdin_fd, .FLUSH, self.original_termios) catch {},
         }
         self.raw_enabled = false;
     }
@@ -243,6 +262,7 @@ pub const TerminalState = struct {
         if (comptime builtin.os.tag == .wasi) {
             return std.Io.File.stdin().readStreaming(io_mod.getIo(), &.{out});
         }
+        if (comptime builtin.os.tag == .windows) return windows_console.read(out);
         return std.posix.read(self.stdin_fd, out);
     }
 
@@ -253,6 +273,9 @@ pub const TerminalState = struct {
                 -1 => .{ .hung_up = true },
                 else => .{},
             };
+        }
+        if (comptime builtin.os.tag == .windows) {
+            return .{ .readable = try windows_console.pollInput(timeout_ms) };
         }
         var fds = [_]std.posix.pollfd{.{
             .fd = self.stdin_fd,

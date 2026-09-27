@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const darwin_process_spawn = @import("darwin_process_spawn.zig");
+const windows_io = @import("windows_io.zig");
 
 pub const RawEnviron = [*:null]const ?[*:0]const u8;
 
@@ -20,7 +21,18 @@ pub fn setIo(zio: std.Io) void {
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
-    return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
+    return switch (os_tag) {
+        .macos => darwin_process_spawn.wrap(zio),
+        .windows => windows_io.wrap(zio),
+        else => zio,
+    };
+}
+
+/// Numeric id of this process. On Windows `pid_t` is a process handle, so
+/// the id comes from the thread environment block instead of `getpid`.
+pub fn processId() u64 {
+    if (comptime builtin.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
+    return @intCast(std.c.getpid());
 }
 
 pub fn getIo() std.Io {
@@ -221,6 +233,7 @@ fn openExistingRegularFileWithPolicy(
         errdefer file.close(getIo());
         const stat = try file.stat(getIo());
         try verifyOpenedRegularFileWithPolicy(stat, policy);
+        try makeFileBlocking(&file);
         return file;
     }
 
@@ -275,7 +288,10 @@ fn verifyOpenedRegularFileWithPolicy(stat: std.Io.File.Stat, policy: RegularFile
     }
 }
 
-fn makeFileBlocking(file: *std.Io.File) !void {
+/// Windows and WASI opens are already blocking, which keeps this error
+/// contract identical across platforms for callers that map it.
+fn makeFileBlocking(file: *std.Io.File) error{FileControlFailed}!void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
     const current = while (true) {
         const rc = std.posix.system.fcntl(
             file.handle,
@@ -413,6 +429,15 @@ pub fn setRawEnviron(raw: RawEnviron) void {
 }
 
 pub fn getenv(key: []const u8) ?[]const u8 {
+    // Windows names the home directory USERPROFILE and rarely sets HOME, so
+    // resolve HOME the way Git for Windows does.
+    if (comptime builtin.os.tag == .windows) {
+        if (std.mem.eql(u8, key, "HOME")) return lookupEnv("HOME") orelse lookupEnv("USERPROFILE");
+    }
+    return lookupEnv(key);
+}
+
+fn lookupEnv(key: []const u8) ?[]const u8 {
     if (global_environ) |m| return m.get(key);
     if (global_environ_block) |block| return getenvFromBlock(block, key);
     if (global_raw_environ) |raw| return getenvFromLibc(key) orelse getenvFromRaw(raw, key);
@@ -475,13 +500,21 @@ fn getenvFromRaw(raw: RawEnviron, key: []const u8) ?[]const u8 {
     while (raw[i]) |entry_z| : (i += 1) {
         const entry = std.mem.sliceTo(entry_z, 0);
         if (entry.len <= key.len or entry[key.len] != '=') continue;
-        if (std.mem.eql(u8, entry[0..key.len], key)) return entry[key.len + 1 ..];
+        // Windows environment names are case-insensitive: PATH is stored as Path.
+        const name_matches = if (comptime builtin.os.tag == .windows)
+            std.ascii.eqlIgnoreCase(entry[0..key.len], key)
+        else
+            std.mem.eql(u8, entry[0..key.len], key);
+        if (name_matches) return entry[key.len + 1 ..];
     }
     return null;
 }
 
 fn getenvFromLibc(key: []const u8) ?[]const u8 {
     if (comptime !builtin.link_libc) return null;
+    // The Windows CRT returns ANSI code page values; the UTF-8 raw environ
+    // built at startup is authoritative there.
+    if (comptime builtin.os.tag == .windows) return null;
     if (key.len >= 128) return null;
 
     var key_buf: [128]u8 = undefined;
@@ -616,8 +649,18 @@ fn verifyPrivateDirectory(dir: std.Io.Dir) !void {
 
 /// The handle must come from an `openDir` that requested iteration. Linux returns an
 /// `O_PATH` descriptor otherwise, and `fsync` rejects those with `EBADF`.
-pub fn syncVerifiedDir(dir: std.Io.Dir) !void {
-    if (comptime builtin.os.tag == .windows) return error.OperationUnsupported;
+pub const SyncVerifiedDirError = error{
+    OperationUnsupported,
+    NoSpaceLeft,
+    DiskQuota,
+    ReadOnlyFileSystem,
+    DirectorySyncFailed,
+};
+
+pub fn syncVerifiedDir(dir: std.Io.Dir) SyncVerifiedDirError!void {
+    // Windows has no directory fsync: NTFS journals directory entries as
+    // metadata, which is the durability a directory fsync provides elsewhere.
+    if (comptime builtin.os.tag == .windows) return;
     while (true) {
         const rc = std.c.fsync(dir.handle);
         if (rc == 0) return;
@@ -934,6 +977,11 @@ pub fn makeDirRecursive(path: []const u8) !void {
 }
 
 pub fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const len = try std.Io.Dir.cwd().realPathFile(getIo(), path, &real_buf);
+        return alloc.dupe(u8, real_buf[0..len]);
+    }
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return error.NameTooLong;
     var result_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1013,6 +1061,13 @@ pub fn dirRealpathAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, sub_path: []c
     } else if (comptime builtin.os.tag == .wasi) {
         if (std.fs.path.isAbsolute(sub_path)) return alloc.dupe(u8, sub_path);
         return std.fs.path.resolve(alloc, &.{sub_path});
+    } else if (comptime builtin.os.tag == .windows) {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const len = if (sub_path.len == 0)
+            try dir.realPath(getIo(), &buf)
+        else
+            try dir.realPathFile(getIo(), sub_path, &buf);
+        return alloc.dupe(u8, buf[0..len]);
     } else {
         @compileError("dirRealpathAlloc not implemented for this OS");
     }

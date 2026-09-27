@@ -23,6 +23,7 @@ const mcp_health = @import("../mcp/health.zig");
 const mcp_runtime = @import("../mcp/mcp_runtime.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const windows_console = @import("../../ui/terminal/windows_console.zig");
 const test_builtin_gateway = if (builtin.is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -40,6 +41,18 @@ const GracefulExitSigintGuard = if (host_target.is_wasm) struct {
     }
 
     fn deinit(_: *@This()) void {}
+} else if (host_target.is_windows) struct {
+    ignoring: bool = false,
+
+    fn install(enabled: bool) @This() {
+        if (!enabled) return .{};
+        return .{ .ignoring = windows_console.ignoreCtrlC(true) };
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.ignoring) _ = windows_console.ignoreCtrlC(false);
+        self.ignoring = false;
+    }
 } else struct {
     saved_action: ?std.posix.Sigaction = null,
 

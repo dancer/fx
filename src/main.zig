@@ -2,8 +2,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const windows_io = @import("core/shared/windows_io.zig");
+const windows_process = @import("core/shared/windows_process.zig");
+const windows_console = @import("ui/terminal/windows_console.zig");
 
 pub const version = "0.0.11";
+
+pub const std_options_FilePermissions: ?type = if (builtin.os.tag == .windows) windows_io.Permissions else null;
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -507,7 +512,7 @@ const App = struct {
     }
 
     pub fn terminalTitle(self: *const Self) host.TerminalTitle {
-        return ui_render.terminalTitleFor(&self.shell.stdout_file);
+        return ui_render.terminalTitleFor(&self.shell.stdoutFile());
     }
 
     alloc: Allocator,
@@ -3364,8 +3369,17 @@ pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char)
 }
 
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
-    const raw_args = rawArgs(c_argc, c_argv);
-    const raw_env: RawEnviron = @ptrCast(c_envp);
+    if (comptime builtin.os.tag == .windows) windows_console.beginUtf8Output();
+    defer if (comptime builtin.os.tag == .windows) windows_console.endUtf8Output();
+
+    const raw_args = if (comptime builtin.os.tag == .windows)
+        try windows_process.utf8Args(processAllocator())
+    else
+        rawArgs(c_argc, c_argv);
+    const raw_env: RawEnviron = if (comptime builtin.os.tag == .windows)
+        try windows_process.utf8Environ(processAllocator())
+    else
+        @ptrCast(c_envp);
 
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
@@ -3547,10 +3561,12 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
 }
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
+    if (comptime builtin.os.tag == .windows) return .{ .vector = windows_process.commandLine() };
     return .{ .vector = raw_args };
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
+    if (comptime builtin.os.tag == .windows) return .global;
     var count: usize = 0;
     while (raw_env[count] != null) : (count += 1) {}
     return .{ .slice = raw_env[0..count :null] };
@@ -3577,7 +3593,12 @@ fn rawEnvValue(raw_env: RawEnviron, comptime key: []const u8) ?[]const u8 {
     while (raw_env[i]) |entry_z| : (i += 1) {
         const entry = std.mem.sliceTo(entry_z, 0);
         if (entry.len <= key.len or entry[key.len] != '=') continue;
-        if (std.mem.eql(u8, entry[0..key.len], key)) return entry[key.len + 1 ..];
+        // Windows environment names are case-insensitive.
+        const name_matches = if (comptime builtin.os.tag == .windows)
+            std.ascii.eqlIgnoreCase(entry[0..key.len], key)
+        else
+            std.mem.eql(u8, entry[0..key.len], key);
+        if (name_matches) return entry[key.len + 1 ..];
     }
     return null;
 }
@@ -3606,12 +3627,21 @@ fn topLevelHelpStyleForValues(is_terminal: bool, no_color: bool, dumb_terminal: 
 }
 
 fn stdoutIsTerminal() bool {
-    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return false;
+    if (comptime builtin.os.tag == .windows) {
+        // Succeeds only for a console, and is what makes ANSI styling render.
+        std.Io.File.stdout().enableAnsiEscapeCodes(io_mod.getIo()) catch return false;
+        return true;
+    }
+    if (comptime !builtin.link_libc) return false;
     return std.c.isatty(std.posix.STDOUT_FILENO) != 0;
 }
 
 fn stdoutTerminalColumns() ?usize {
-    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return null;
+    if (comptime builtin.os.tag == .windows) {
+        const size = windows_console.querySize() catch return null;
+        return size.cols;
+    }
+    if (comptime !builtin.link_libc) return null;
 
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);
@@ -3686,6 +3716,7 @@ fn exitFast(code: u8) noreturn {
     if (comptime builtin.link_libc and builtin.os.tag != .windows and builtin.os.tag != .wasi) {
         std.c._exit(@intCast(code));
     }
+    if (comptime builtin.os.tag == .windows) windows_console.endUtf8Output();
     std.process.exit(code);
 }
 
@@ -3994,7 +4025,7 @@ fn handleSigWinchWeb() callconv(.c) void {
     resize_interlock.noteResizeSignal();
 }
 
-const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm)
+const handle_sigwinch: app_lifecycle.ResizeHandler = if (host_target.is_wasm or host_target.is_windows)
     handleSigWinchWeb
 else
     handleSigWinchNative;

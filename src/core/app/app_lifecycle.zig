@@ -1371,7 +1371,7 @@ fn emitShutdownCleanupAndResume(shell: *TranscriptRuntime, metrics: *Metrics) vo
 }
 
 pub fn writeLifecycleTerminalBytes(shell: *TranscriptRuntime, metrics: *Metrics, bytes: []const u8) !void {
-    try shell.stdout_file.writeStreamingAll(io_mod.getIo(), bytes);
+    try shell.stdoutFile().writeStreamingAll(io_mod.getIo(), bytes);
     if (shell.shadow_vt) |grid| {
         grid.feed(bytes) catch |err| debug_trace.logf(
             "render",
@@ -1633,7 +1633,7 @@ test "lifecycle terminal writer updates bytes metrics and shadow" {
 
     var metrics = Metrics{};
     try writeLifecycleTerminalBytes(&shell, &metrics, "x");
-    shell.stdout_file.close(io_mod.getIo());
+    shell.stdout_file.?.close(io_mod.getIo());
 
     var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
     defer read_file.close(io_mod.getIo());
@@ -1678,7 +1678,7 @@ test "approval alternate screen lifecycle restores the shadow terminal once" {
     try writeLifecycleTerminalBytes(&shell, &metrics, "approval");
     try leaveApprovalScreen(&terminal, &shell, &metrics);
     try leaveApprovalScreen(&terminal, &shell, &metrics);
-    shell.stdout_file.close(io_mod.getIo());
+    shell.stdout_file.?.close(io_mod.getIo());
 
     var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
     defer read_file.close(io_mod.getIo());
@@ -1757,7 +1757,7 @@ test "full transcript alternate screen preserves native selection and restores t
     try leaveFullTranscriptScreen(&terminal, &shell, &metrics);
     try std.testing.expectEqual(@as(u64, 0), terminal.alternate_frame_layout.layout_id);
     try leaveFullTranscriptScreen(&terminal, &shell, &metrics);
-    shell.stdout_file.close(io_mod.getIo());
+    shell.stdout_file.?.close(io_mod.getIo());
 
     var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
     defer read_file.close(io_mod.getIo());
@@ -1803,7 +1803,7 @@ test "skills menu alternate screen lifecycle restores the shadow terminal once" 
     try writeLifecycleTerminalBytes(&shell, &metrics, "skills");
     try leaveCatalogMenuScreen(&terminal, &shell, &metrics);
     try leaveCatalogMenuScreen(&terminal, &shell, &metrics);
-    shell.stdout_file.close(io_mod.getIo());
+    shell.stdout_file.?.close(io_mod.getIo());
 
     var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
     defer read_file.close(io_mod.getIo());
@@ -1852,7 +1852,7 @@ test "full transcript handoff to approval reuses the alternate screen" {
     try std.testing.expect(terminal.alternate_mouse_tracking_active);
     try writeLifecycleTerminalBytes(&shell, &metrics, "approval");
     try leaveApprovalScreen(&terminal, &shell, &metrics);
-    shell.stdout_file.close(io_mod.getIo());
+    shell.stdout_file.?.close(io_mod.getIo());
 
     var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
     defer read_file.close(io_mod.getIo());
@@ -1951,7 +1951,7 @@ test "full transcript transitions own terminal and projection together" {
     try std.testing.expect(shell.transcript_band_dirty);
     try std.testing.expect(shell.render_requests.hasReason(.transcript));
 
-    shell.stdout_file.close(io_mod.getIo());
+    shell.stdout_file.?.close(io_mod.getIo());
     var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
     defer read_file.close(io_mod.getIo());
     const bytes = try io_mod.readFileToEnd(alloc, &read_file, 512);
@@ -2003,7 +2003,7 @@ test "full transcript drift recovery is explicit and scoped to lifecycle" {
         FullTranscriptLifecycleState.inactive,
         fullTranscriptLifecycleState(&terminal_only, &terminal_only_shell),
     );
-    terminal_only_shell.stdout_file.close(io_mod.getIo());
+    terminal_only_shell.stdout_file.?.close(io_mod.getIo());
 
     var terminal_only_read = try tmp.dir.openFile(io_mod.getIo(), terminal_only_path, .{});
     defer terminal_only_read.close(io_mod.getIo());
@@ -2042,7 +2042,7 @@ test "full transcript drift recovery is explicit and scoped to lifecycle" {
         FullTranscriptLifecycleState.inactive,
         fullTranscriptLifecycleState(&projection_only, &projection_only_shell),
     );
-    projection_only_shell.stdout_file.close(io_mod.getIo());
+    projection_only_shell.stdout_file.?.close(io_mod.getIo());
 
     var projection_only_read = try tmp.dir.openFile(io_mod.getIo(), projection_only_path, .{});
     defer projection_only_read.close(io_mod.getIo());
@@ -2108,7 +2108,7 @@ test "launch scrollback push creates top-of-viewport space" {
 
     var metrics = Metrics{};
     try pushLaunchRowsIntoScrollback(&shell, &metrics, 3);
-    shell.stdout_file.close(io_mod.getIo());
+    shell.stdout_file.?.close(io_mod.getIo());
 
     var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
     defer read_file.close(io_mod.getIo());
@@ -2142,7 +2142,7 @@ test "prepare startup viewport uses scrollback setting for launch push only" {
     var metrics = Metrics{};
     var enabled_launch_row: u16 = 6;
     const enabled_reservation = try prepareStartupViewport(&enabled_shell, &metrics, &enabled_launch_row, 11, true);
-    enabled_shell.stdout_file.close(io_mod.getIo());
+    enabled_shell.stdout_file.?.close(io_mod.getIo());
 
     var enabled_read = try tmp.dir.openFile(io_mod.getIo(), enabled_path, .{});
     defer enabled_read.close(io_mod.getIo());
@@ -2163,7 +2163,7 @@ test "prepare startup viewport uses scrollback setting for launch push only" {
 
     var disabled_launch_row: u16 = 6;
     const disabled_reservation = try prepareStartupViewport(&disabled_shell, &metrics, &disabled_launch_row, 11, false);
-    disabled_shell.stdout_file.close(io_mod.getIo());
+    disabled_shell.stdout_file.?.close(io_mod.getIo());
 
     var disabled_read = try tmp.dir.openFile(io_mod.getIo(), disabled_path, .{});
     defer disabled_read.close(io_mod.getIo());
@@ -2210,7 +2210,7 @@ test "shutdown cleanup erases from footer frame top after frame commit" {
 
     var metrics = Metrics{};
     emitShutdownCleanupAndResume(&shell, &metrics);
-    shell.stdout_file.close(io_mod.getIo());
+    shell.stdout_file.?.close(io_mod.getIo());
 
     var read_file = try tmp.dir.openFile(io_mod.getIo(), out_path, .{});
     defer read_file.close(io_mod.getIo());

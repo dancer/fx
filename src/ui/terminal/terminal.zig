@@ -1,5 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("../../core/shared/types.zig");
+const windows_console = @import("windows_console.zig");
 
 pub const interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?7l";
 const tmux_interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[?2004h\x1b[?7l";
@@ -33,7 +35,9 @@ pub fn interactiveModeEnableSequence(tmux: ?[]const u8) []const u8 {
         tmux_interactive_mode_enable_sequence;
 }
 
+/// Windows reports console geometry for the output buffer, not per handle.
 pub fn queryLayout(fd: std.posix.fd_t, footer_rows: u16) !types.Layout {
+    if (comptime builtin.os.tag == .windows) return windows_console.queryLayout(footer_rows);
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
 
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);
@@ -42,6 +46,12 @@ pub fn queryLayout(fd: std.posix.fd_t, footer_rows: u16) !types.Layout {
         return error.UnableToReadTerminalSize;
     }
     return layoutFromSize(ws.row, ws.col, footer_rows);
+}
+
+/// Windows handles are consoles rather than ttys, so isatty(3) cannot see them.
+pub fn isTty(handle: std.posix.fd_t) bool {
+    if (comptime builtin.os.tag == .windows) return windows_console.isConsole(handle);
+    return std.c.isatty(handle) != 0;
 }
 
 pub fn layoutFromSize(rows: u16, cols: u16, footer_rows: u16) !types.Layout {

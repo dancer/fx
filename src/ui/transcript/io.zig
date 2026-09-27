@@ -41,7 +41,7 @@ pub fn disableShadowVt(shell: anytype) void {
 pub fn writeFrameBytes(shell: anytype, metrics: *Metrics, bytes: []const u8) terminal_diff.FrameSinkWriteResult {
     var accepted_bytes: usize = 0;
     while (accepted_bytes < bytes.len) {
-        const written = shell.stdout_file.writeStreaming(
+        const written = shell.stdoutFile().writeStreaming(
             io_mod.getIo(),
             &.{},
             &.{bytes[accepted_bytes..]},
