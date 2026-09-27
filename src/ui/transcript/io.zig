@@ -76,6 +76,10 @@ test "writeFrameBytes writes the frame without feeding shadow" {
     const FakeShell = struct {
         stdout_file: std.Io.File,
         shadow_vt: ?*vt_emulator.Grid = null,
+
+        fn stdoutFile(self: *const @This()) std.Io.File {
+            return self.stdout_file;
+        }
     };
 
     var tmp = std.testing.tmpDir(.{});
@@ -101,6 +105,10 @@ test "standalone presentation bell is written without changing the shadow grid" 
     const FakeShell = struct {
         stdout_file: std.Io.File,
         shadow_vt: ?*vt_emulator.Grid = null,
+
+        fn stdoutFile(self: *const @This()) std.Io.File {
+            return self.stdout_file;
+        }
     };
 
     var tmp = std.testing.tmpDir(.{});
