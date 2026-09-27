@@ -406,6 +406,13 @@ fn appendLineToFile(zio: std.Io, path: []const u8, line: []const u8) void {
         .lock = .exclusive,
     }) catch return;
     defer file.close(zio);
+    if (comptime @import("builtin").os.tag == .windows) {
+        // The CRT's lseek takes a C descriptor, not a HANDLE. The exclusive
+        // lock keeps the length stable until the write lands.
+        const end = file.length(zio) catch return;
+        file.writePositionalAll(zio, line, end) catch {};
+        return;
+    }
     _ = std.c.lseek(file.handle, 0, std.posix.SEEK.END);
     file.writeStreamingAll(zio, line) catch {};
 }

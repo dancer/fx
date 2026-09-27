@@ -3156,7 +3156,7 @@ pub const WritableSessionDir = struct {
             break :blk false;
         };
         const body = std.fmt.allocPrint(alloc, "{{\"pid\":{d},\"opened_at_ms\":{d}}}\n", .{
-            std.c.getpid(),
+            io_mod.processId(),
             io_mod.milliTimestamp(),
         }) catch |err| {
             debug_trace.logf("session", "owner liveness mark allocation failed id={s} err={s}", .{ self.session_id, @errorName(err) });
@@ -4120,9 +4120,17 @@ pub const Root = struct {
             options,
         );
         writable_owned = false;
-        errdefer loaded.deinit(alloc);
+        var loaded_open = true;
+        errdefer if (loaded_open) loaded.deinit(alloc);
         try loaded.conversation_writer.file.sync(io_mod.getIo());
         try io_mod.syncVerifiedDir(loaded.log.dir.dir);
+        // Windows refuses to rename a directory while files inside it are
+        // open, so publish it closed and reopen through the resume path. The
+        // fresh random id means nothing else can claim it in between.
+        if (comptime @import("builtin").os.tag == .windows) {
+            loaded.deinit(alloc);
+            loaded_open = false;
+        }
         publishSessionDirectory(sessions.dir, staging_name, initial_state.id) catch |err| {
             if (err == error.PathAlreadyExists) return error.SessionAlreadyExists;
             debug_trace.logf("session", "session creation publication failed id={s} err={s}", .{ initial_state.id, @errorName(err) });
@@ -4133,6 +4141,7 @@ pub const Root = struct {
             debug_trace.logf("session", "session creation retained published state id={s} durability=uncertain err={s}", .{ initial_state.id, @errorName(err) });
             return error.SessionStartFailed;
         };
+        if (comptime @import("builtin").os.tag == .windows) return self.resumeForWrite(alloc, initial_state.id, options);
         return loaded;
     }
 

@@ -376,8 +376,13 @@ fn sameStat(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
         a.permissions.toMode() == b.permissions.toMode() and a.mtime.nanoseconds == b.mtime.nanoseconds and a.ctime.nanoseconds == b.ctime.nanoseconds;
 }
 
+/// Reinterprets a stat field's bits as unsigned; Windows inode numbers are signed.
+fn unsignedBits(value: anytype) std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(value))) {
+    return @bitCast(value);
+}
+
 fn addStat(hash: *Sha256, stat: std.Io.File.Stat) void {
-    const values = [_]u128{ stat.inode, stat.nlink, stat.size, @intFromEnum(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
+    const values = [_]u128{ unsignedBits(stat.inode), stat.nlink, stat.size, @intFromEnum(stat.kind), stat.permissions.toMode(), @bitCast(@as(i128, stat.mtime.nanoseconds)), @bitCast(@as(i128, stat.ctime.nanoseconds)) };
     var bytes: [16]u8 = undefined;
     for (values) |value| {
         std.mem.writeInt(u128, &bytes, value, .little);
