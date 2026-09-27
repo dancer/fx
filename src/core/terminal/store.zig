@@ -1,4 +1,7 @@
 const std = @import("std");
+
+/// Records store numeric process ids, while Windows `pid_t` is a handle.
+const RecordPid = if (@import("builtin").os.tag == .windows) std.os.windows.DWORD else std.posix.pid_t;
 const contracts = @import("contracts.zig");
 const operation = @import("operation.zig");
 const recovery = @import("recovery.zig");
@@ -394,7 +397,7 @@ pub const Record = struct {
             return error.InvalidTerminalRecord;
         }
         if (self.takeover_owner_pid) |pid| {
-            _ = std.fmt.parseInt(std.posix.pid_t, pid, 10) catch
+            _ = std.fmt.parseInt(RecordPid, pid, 10) catch
                 return error.InvalidTerminalRecord;
             _ = process_identity.ProcessInstanceToken.parse(
                 self.takeover_owner_process_token.?,

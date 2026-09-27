@@ -200,7 +200,7 @@ pub const Paths = struct {
     endpoint_path: []u8,
 
     pub fn open(alloc: Allocator, home: []const u8) !Paths {
-        if (!isSupported()) return error.TerminalHostUnsupported;
+        if (comptime !isSupported()) return error.TerminalHostUnsupported;
         var selection = try resolveEndpointSelection(
             alloc,
             builtin.os.tag,

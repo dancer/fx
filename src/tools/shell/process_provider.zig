@@ -19,6 +19,7 @@ fn captureToken(
     alloc: Allocator,
     pid_text: []const u8,
 ) process_provider.ProviderError!process_identity.ProcessInstanceToken {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return error.ProcessIdentityUnsupported;
     const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
         return error.InvalidPid;
     return switch (builtin.os.tag) {
@@ -227,7 +228,7 @@ fn signalProcess(
         .missing, .mismatched => return error.ProcessIdentityMismatch,
         .unavailable => return error.ProcessIdentityIndeterminate,
     }
-    if (!host.current().process_control) return error.Unsupported;
+    if (comptime !host.current().process_control) return error.Unsupported;
     const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
         return error.InvalidPid;
     var tracker = try process_tree.Tracker.init(alloc);
