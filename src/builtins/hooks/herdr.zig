@@ -53,6 +53,9 @@ pub const Client = struct {
     }
 
     pub fn initFromEnv(self: *Client, alloc: std.mem.Allocator) void {
+        // The reply timeout that keeps reports from blocking a session is
+        // POSIX-only, so reporting stays off rather than risk a hang.
+        if (comptime host_target.is_windows) return;
         const socket_path = io_mod.getenv("HERDR_SOCKET_PATH");
         const pane_id = io_mod.getenv("HERDR_PANE_ID");
         if (!shouldEnable(io_mod.getenv("FX_HERDR"), socket_path, pane_id)) {
@@ -181,6 +184,7 @@ pub const Client = struct {
 };
 
 fn applyResponseTimeout(stream: std.Io.net.Stream) void {
+    if (comptime host_target.is_windows) return;
     std.posix.setsockopt(
         stream.socket.handle,
         std.posix.SOL.SOCKET,

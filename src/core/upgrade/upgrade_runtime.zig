@@ -31,6 +31,7 @@ const RunError = error{
     ReplaceFailed,
     OutOfMemory,
     Cancelled,
+    UnsupportedPlatform,
 };
 
 pub fn run(
@@ -48,6 +49,7 @@ fn runInner(
     channel: update_target.Channel,
     format: output_contracts.OutputFormat,
 ) RunError!RunResult {
+    if (comptime !helpers.supported) return error.UnsupportedPlatform;
     var done = std.atomic.Value(bool).init(false);
     var progress = ProgressState{};
     var worker_result = WorkerResult{};
@@ -140,6 +142,7 @@ fn failureMessage(err: RunError) []const u8 {
         error.ReplaceFailed => "failed to replace binary (permission denied?)",
         error.OutOfMemory => "out of memory",
         error.Cancelled => "upgrade cancelled",
+        error.UnsupportedPlatform => "no release build for this platform; rebuild from source to update",
     };
 }
 

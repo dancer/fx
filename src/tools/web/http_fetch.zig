@@ -450,6 +450,7 @@ fn isRetryableConnectError(err: anyerror) bool {
 }
 
 fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
+    if (comptime @import("builtin").os.tag == .windows) return error.WebFetchUnsupportedPlatform;
     const effective = normalizedOptions(options);
     const dialer: Dialer = .{
         .ctx = @ptrCast(&default_connector_ctx),

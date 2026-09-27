@@ -46,6 +46,9 @@ fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
     return std.mem.eql(u8, host, "127.0.0.1");
 }
 
+/// False on targets with no published release build to upgrade to.
+pub const supported = platformFromTarget() != null;
+
 pub const platform = platformFromTarget() orelse
     @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
 
