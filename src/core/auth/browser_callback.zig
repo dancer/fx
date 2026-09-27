@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const windows_socket_poll = @import("../shared/windows_socket_poll.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -171,6 +173,15 @@ fn listenerReady(
     cancel_flag: Cancellation,
 ) !bool {
     if (cancel_flag.cancelled()) return error.Cancelled;
+    if (comptime builtin.os.tag == .windows) {
+        const readiness = try windows_socket_poll.wait(listener.socket.handle, .accept, poll_ms);
+        if (cancel_flag.cancelled()) return error.Cancelled;
+        return switch (readiness) {
+            .timeout => false,
+            .ready => true,
+            .closed => error.OAuthCallbackListenerFailed,
+        };
+    }
     var fds = [_]std.posix.pollfd{.{
         .fd = listener.socket.handle,
         .events = std.posix.POLL.IN,
@@ -197,14 +208,18 @@ fn requestReadable(
             0
         else
             @intCast(@min(remaining_ms, poll_ms));
-        var fds = [_]std.posix.pollfd{.{
-            .fd = socket,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const ready = try std.posix.poll(&fds, wait_ms);
+        const ready = if (comptime builtin.os.tag == .windows)
+            try windows_socket_poll.wait(socket, .receive, @intCast(wait_ms)) != .timeout
+        else ready: {
+            var fds = [_]std.posix.pollfd{.{
+                .fd = socket,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            break :ready try std.posix.poll(&fds, wait_ms) != 0;
+        };
         if (cancel_flag.cancelled()) return error.Cancelled;
-        if (ready != 0) return true;
+        if (ready) return true;
         if (remaining_ms <= 0) return false;
     }
 }
@@ -404,6 +419,9 @@ fn writePreflightResponse(stream: std.Io.net.Stream, origin: []const u8) !void {
 }
 
 fn setSocketTimeouts(socket: std.posix.socket_t) void {
+    // Winsock rejects std.Io.net's AFD sockets; reads there are already
+    // bounded by the readiness waits in requestReadable.
+    if (comptime builtin.os.tag == .windows) return;
     const timeout = std.posix.timeval{ .sec = socket_timeout_seconds, .usec = 0 };
     const receive_rc = std.c.setsockopt(
         socket,

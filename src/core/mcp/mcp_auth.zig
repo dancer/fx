@@ -2274,7 +2274,9 @@ fn validateJsonContentType(content_type: ?[]const u8) !void {
 }
 
 fn setSocketTimeouts(socket: std.posix.socket_t, seconds: i64) void {
-    if (comptime host_target.is_wasm) return;
+    // Socket receive timeouts are a Winsock feature, and Winsock rejects the
+    // AFD sockets std.Io.net opens on Windows.
+    if (comptime host_target.is_wasm or host_target.is_windows) return;
     const timeout = std.posix.timeval{ .sec = seconds, .usec = 0 };
     const receive_rc = std.c.setsockopt(
         socket,
