@@ -652,8 +652,24 @@ fn commandInPathValue(alloc: Allocator, command_name: []const u8, path_env: []co
         if (pathExists(candidate)) {
             return true;
         }
+        if (comptime @import("builtin").os.tag == .windows) {
+            if (try windowsExecutableExists(alloc, entry, command_name)) return true;
+        }
     }
 
+    return false;
+}
+
+/// Windows resolves a bare name like `gh` to `gh.exe` through PATHEXT.
+fn windowsExecutableExists(alloc: Allocator, dir: []const u8, command_name: []const u8) !bool {
+    const extensions = io_mod.getenv("PATHEXT") orelse ".COM;.EXE;.BAT;.CMD";
+    var it = std.mem.splitScalar(u8, extensions, ';');
+    while (it.next()) |extension| {
+        if (extension.len == 0) continue;
+        const candidate = try std.fmt.allocPrint(alloc, "{s}" ++ std.fs.path.sep_str ++ "{s}{s}", .{ dir, command_name, extension });
+        defer alloc.free(candidate);
+        if (pathExists(candidate)) return true;
+    }
     return false;
 }
 
