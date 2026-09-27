@@ -82,7 +82,7 @@ fn inner() *const std.Io.VTable {
 /// governed by inherited ACLs rather than anything stat can express.
 fn with_private_mode(stat: std.Io.File.Stat) std.Io.File.Stat {
     var result = stat;
-    result.permissions = .fromMode(if (stat.kind == .directory) 0o700 else 0o600);
+    result.permissions = @enumFromInt(@as(std.posix.mode_t, if (stat.kind == .directory) 0o700 else 0o600));
     return result;
 }
 
@@ -166,8 +166,8 @@ test "private modes follow the entry kind" {
     var dir = base;
     dir.kind = .directory;
 
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), with_private_mode(base).permissions.toMode());
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), with_private_mode(dir).permissions.toMode());
+    try std.testing.expectEqual(0o600, @intFromEnum(with_private_mode(base).permissions));
+    try std.testing.expectEqual(0o700, @intFromEnum(with_private_mode(dir).permissions));
 }
 
 test "read-only mode maps to the READONLY attribute and back" {
