@@ -738,7 +738,7 @@ fn captureImageSnapshotFromOpenFileWithBudget(
     // sources need the platform resizer: byte-oversized ones can never be
     // sent, so they fail without it, and pixel-oversized ones are kept for
     // request building to withhold with a note.
-    const can_normalize = comptime builtin.os.tag == .macos;
+    const can_normalize = comptime builtin.os.tag == .macos or builtin.os.tag == .windows;
     const over_bytes = !fitsEncodedLimit(source_metadata.size_bytes);
     const over_pixels = try snapshotExceedsModelDimensions(snapshot_dir_handle, source_temp_name, budget);
     const shrink_in_process = over_pixels and png_downscale.supportsMediaType(source_metadata.media_type);
@@ -1213,7 +1213,9 @@ fn stopImageNormalizer(
     const io = io_mod.getIo();
     const cancel_protection = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(cancel_protection);
-    std.posix.kill(pid, .KILL) catch |err| debug_trace.logf(
+    if (comptime builtin.os.tag == .windows) {
+        if (!TerminateProcess(pid, 1).toBool()) debug_trace.logf("images", "event=image_normalizer_kill_failed err=TerminateProcess", .{});
+    } else std.posix.kill(pid, .KILL) catch |err| debug_trace.logf(
         "images",
         "event=image_normalizer_kill_failed err={s}",
         .{@errorName(err)},
@@ -1284,6 +1286,36 @@ fn resizeWithPlatformTool(
     return .{ .resized = metadata };
 }
 
+/// Mirrors the sips call: fit within the pixel limit without upscaling,
+/// honor EXIF rotation, and write JPEG at quality 85 over white. Windows
+/// PowerShell mangles double quotes in native arguments, so there are none.
+const windows_resize_script = "$ErrorActionPreference='Stop';Add-Type -AssemblyName System.Drawing;" ++
+    "$i=[Drawing.Image]::FromFile({f});" ++
+    "if($i.PropertyIdList -contains 274){{$t=@{{3='Rotate180FlipNone';6='Rotate90FlipNone';8='Rotate270FlipNone'}}[[int]$i.GetPropertyItem(274).Value[0]];if($t){{$i.RotateFlip($t)}}}};" ++
+    "$r=[Math]::Min(1.0,{d}/[Math]::Max($i.Width,$i.Height));" ++
+    "$w=[Math]::Max(1,[int][Math]::Floor($i.Width*$r));$h=[Math]::Max(1,[int][Math]::Floor($i.Height*$r));" ++
+    "$b=New-Object Drawing.Bitmap $w,$h;$g=[Drawing.Graphics]::FromImage($b);$g.Clear([Drawing.Color]::White);" ++
+    "$g.InterpolationMode='HighQualityBicubic';$g.DrawImage($i,0,0,$w,$h);" ++
+    "$e=[Drawing.Imaging.ImageCodecInfo]::GetImageEncoders()|?{{$_.MimeType -eq 'image/jpeg'}};" ++
+    "$p=New-Object Drawing.Imaging.EncoderParameters 1;" ++
+    "$p.Param[0]=New-Object Drawing.Imaging.EncoderParameter ([Drawing.Imaging.Encoder]::Quality),([long]85);" ++
+    "$b.Save({f},$e,$p)";
+
+fn powershellQuoted(text: []const u8) std.fmt.Alt([]const u8, writePowershellQuoted) {
+    return .{ .data = text };
+}
+
+fn writePowershellQuoted(text: []const u8, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.writeByte('\'');
+    for (text) |byte| {
+        if (byte == '\'') try writer.writeByte('\'');
+        try writer.writeByte(byte);
+    }
+    try writer.writeByte('\'');
+}
+
+extern "kernel32" fn TerminateProcess(process: std.os.windows.HANDLE, exit_code: c_uint) callconv(.winapi) std.os.windows.BOOL;
+
 fn prepareImageCandidate(
     source_path: []const u8,
     candidate_path: []const u8,
@@ -1294,6 +1326,17 @@ fn prepareImageCandidate(
             const argv = [_][]const u8{ "/bin/sh", "-c", resizer.script, "resizer", source_path, candidate_path };
             return runImageNormalizerProcess(&argv, budget, resizer.timeout);
         }
+    }
+    if (comptime builtin.os.tag == .windows) {
+        var script_buffer: [8192 + windows_resize_script.len]u8 = undefined;
+        var script: std.Io.Writer = .fixed(&script_buffer);
+        script.print(windows_resize_script, .{
+            powershellQuoted(source_path),
+            image_data.max_image_dimension,
+            powershellQuoted(candidate_path),
+        }) catch return error.ImagePreparationFailed;
+        const argv = [_][]const u8{ "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script.buffered() };
+        return runImageNormalizerProcess(&argv, budget, image_normalization_timeout);
     }
     const argv = [_][]const u8{
         "/usr/bin/sips",
