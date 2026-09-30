@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const windows_socket_poll = @import("../../core/shared/windows_socket_poll.zig");
 const url_policy = @import("url_policy.zig");
 
 const Allocator = std.mem.Allocator;
@@ -450,7 +451,6 @@ fn isRetryableConnectError(err: anyerror) bool {
 }
 
 fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
-    if (comptime @import("builtin").os.tag == .windows) return error.WebFetchUnsupportedPlatform;
     const effective = normalizedOptions(options);
     const dialer: Dialer = .{
         .ctx = @ptrCast(&default_connector_ctx),
@@ -1222,8 +1222,18 @@ fn readChunkedTrailers(reader: *BodyReader, alloc: Allocator) !void {
     }
 }
 
+// Windows sockets come from `std.Io.net`, which opens them on the AFD driver
+// that Winsock's poll and send reject. Reads wait for data with the AFD poll
+// instead, and std cannot yet bound a connect, so only the fetch deadline and
+// cancel checks between attempts apply to it.
+const is_windows = @import("builtin").os.tag == .windows;
+
 fn connectPinned(address: IpAddress, options: FetchOptions) !posix.fd_t {
     try checkControl(options);
+    if (comptime is_windows) {
+        const stream = try address.connect(io_mod.getIo(), .{ .mode = .stream });
+        return stream.socket.handle;
+    }
     const family: posix.sa_family_t = switch (address) {
         .ip4 => posix.AF.INET,
         .ip6 => posix.AF.INET6,
@@ -1347,6 +1357,10 @@ fn checkSocketError(fd: posix.fd_t) !void {
 }
 
 fn closeFd(fd: posix.fd_t) void {
+    if (comptime is_windows) {
+        const zio = io_mod.getIo();
+        return zio.vtable.netClose(zio.userdata, &.{fd});
+    }
     while (true) switch (posix.errno(posix.system.close(fd))) {
         .SUCCESS => return,
         .INTR => continue,
@@ -1577,6 +1591,15 @@ fn classifyWriteErrno(err: posix.E) SyscallErrorAction {
 }
 
 fn rawRead(fd: posix.fd_t, buf: []u8, options: FetchOptions) !usize {
+    if (comptime is_windows) {
+        while (true) switch (try windows_socket_poll.wait(fd, .receive, @intCast(try pollTimeoutMs(options)))) {
+            .timeout => continue,
+            .ready, .closed => break,
+        };
+        const zio = io_mod.getIo();
+        var data = [_][]u8{buf};
+        return zio.vtable.netRead(zio.userdata, fd, &data);
+    }
     return rawReadWith(fd, buf, options, default_poller, default_read_syscall);
 }
 
@@ -1603,6 +1626,17 @@ fn rawReadWith(
 }
 
 fn rawWriteAll(fd: posix.fd_t, bytes: []const u8, options: FetchOptions) !void {
+    if (comptime is_windows) {
+        const zio = io_mod.getIo();
+        var written: usize = 0;
+        while (written < bytes.len) {
+            try checkControl(options);
+            const n = try zio.vtable.netWrite(zio.userdata, fd, &.{}, &.{bytes[written..]}, 1);
+            if (n == 0) return error.UnexpectedClose;
+            written += n;
+        }
+        return;
+    }
     return rawWriteAllWith(fd, bytes, options, default_poller);
 }
 
