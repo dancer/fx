@@ -19,6 +19,8 @@ const types = @import("core/shared/types.zig");
 const command_runner = @import("core/execution/command_runner.zig");
 const command_contract = @import("core/execution/command_contract.zig");
 const command_environment = @import("core/execution/command_environment.zig");
+const command_admission = @import("core/permissions/command_admission.zig");
+const managed_execution = @import("core/execution/managed_execution.zig");
 const shell_resolver = @import("core/terminal/shell_resolver.zig");
 const windows_shell = @import("core/execution/windows_shell.zig");
 const http_fetch = @import("tools/web/http_fetch.zig");
@@ -203,6 +205,50 @@ const Smoke = struct {
         }
         print("ok    {s} ({d} ms)", .{ label, duration_ms });
     }
+
+    fn startManaged(self: *Smoke, runtime: *managed_execution.Runtime, id: []const u8, command: []const u8, yield_time_ms: u32) !managed_execution.Snapshot {
+        var input: managed_execution.StartCapturedInput = .{
+            .execution_id = id,
+            .command = command,
+            .cwd = self.root,
+            .environment = .legacy,
+            .authority = undefined,
+            .max_output_bytes = 64 * 1024,
+            .timeout_ms = null,
+            .command_artifact_dir = null,
+            .yield_time_ms = yield_time_ms,
+        };
+        const ctx: command_admission.CommandContext = .{ .command = command, .resolved_cwd = self.root, .target_os = builtin.os.tag, .environment = .legacy };
+        input.authority = .{ .shell_allowed = .{ .fingerprint = .init(ctx), .source = .yolo } };
+        const started = try runtime.startCaptured(self.alloc, input);
+        try runtime.commitDelivery(started.snapshot.execution_id, started.reservation_id);
+        return started.snapshot;
+    }
+
+    fn expectManagedStop(self: *Smoke, runtime: *managed_execution.Runtime, command: []const u8) !void {
+        const started = try self.startManaged(runtime, "smoke-stop", command, 1500);
+        if (started.state != .running) return self.fail("managed yields a running handle", "running", @tagName(started.state));
+        if (std.mem.find(u8, started.output_delta, "ready") == null) return self.fail("managed yields a running handle", "ready", started.output_delta);
+        print("ok    managed yields a running handle", .{});
+
+        const started_ms = io_mod.milliTimestamp();
+        const stopped = try runtime.stop(self.alloc, "smoke-stop", false);
+        try runtime.commitDelivery(stopped.snapshot.execution_id, stopped.reservation_id);
+        const duration_ms = io_mod.milliTimestamp() - started_ms;
+        if (stopped.snapshot.state != .stopped) return self.fail("managed stop", "stopped", @tagName(stopped.snapshot.state));
+        if (duration_ms > 3000) return self.fail("managed stop", "under 3000 ms", try std.fmt.allocPrint(self.alloc, "{d} ms", .{duration_ms}));
+        print("ok    managed stop ({d} ms)", .{duration_ms});
+    }
+
+    fn expectManagedCompletion(self: *Smoke, runtime: *managed_execution.Runtime, command: []const u8) !void {
+        const snapshot = try self.startManaged(runtime, "smoke-complete", command, 10_000);
+        switch (snapshot.state) {
+            .completed => |status| if (status != .exit_code or status.exit_code != 0) return self.fail("managed completes", "exit 0", snapshot.output_delta),
+            else => return self.fail("managed completes", "completed", @tagName(snapshot.state)),
+        }
+        if (std.mem.find(u8, snapshot.output_delta, "done") == null) return self.fail("managed completes", "done", snapshot.output_delta);
+        print("ok    managed completes", .{});
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -252,6 +298,8 @@ fn runCommandChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
     const user = try shell_resolver.environment(alloc, configured, .user);
     const clean = try shell_resolver.environment(alloc, configured, .clean);
+    var managed = managed_execution.Runtime.init(alloc);
+    defer managed.deinit();
     switch (shell.kind) {
         .bash => {
             try smoke.expectCommand("command user profile", spaced, "shopt -q expand_aliases && echo aliases", .{ .contains = "aliases", .environment = user });
@@ -266,9 +314,12 @@ fn runCommandChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
             try smoke.expectCommand("command runs git", spaced, "git --version", .{ .contains = "git version" });
             try smoke.expectCommand("command timeout", spaced, "sleep 3; echo late > timeout-marker", .{ .timeout_ms = 1000, .max_duration_ms = 4000 });
             try smoke.expectCommand("command background child", spaced, "(sleep 3; echo late > background-marker) & echo started", .{ .contains = "started", .max_duration_ms = 4000 });
+            try smoke.expectManagedStop(&managed, "echo ready; sleep 3; echo late > managed-marker");
+            try smoke.expectManagedCompletion(&managed, "sleep 1; echo done");
             io_mod.sleep(4 * std.time.ns_per_s);
             smoke.expectAbsent("timeout stops children", "timeout-marker");
             smoke.expectAbsent("exit stops background children", "background-marker");
+            smoke.expectAbsent("managed stop stops children", "managed-marker");
         },
         .powershell => {
             try smoke.expectCommand("command user profile", spaced, "Write-Output \"user\"", .{ .contains = "user", .environment = user });
@@ -282,8 +333,11 @@ fn runCommandChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
             try smoke.expectCommand("command cwd with spaces", spaced, "(Get-Location).Path", .{ .contains = "dir with spaces" });
             try smoke.expectCommand("command multi-line script", spaced, "foreach ($n in 1, 2) {\n  \"n=$n\"\n}", .{ .contains = "n=2" });
             try smoke.expectCommand("command timeout", spaced, "cmd /c \"ping -n 4 127.0.0.1 >nul & echo late > timeout-marker\"", .{ .timeout_ms = 1000, .max_duration_ms = 4000 });
+            try smoke.expectManagedStop(&managed, "Write-Output ready; cmd /c \"ping -n 4 127.0.0.1 >nul & echo late > managed-marker\"");
+            try smoke.expectManagedCompletion(&managed, "Start-Sleep 1; Write-Output done");
             io_mod.sleep(4 * std.time.ns_per_s);
             smoke.expectAbsent("timeout stops children", "timeout-marker");
+            smoke.expectAbsent("managed stop stops children", "managed-marker");
         },
     }
     return smoke.failures;
