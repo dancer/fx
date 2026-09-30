@@ -15,6 +15,7 @@ const types = @import("../shared/types.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 const windows_shell = @import("windows_shell.zig");
+const windows_job = @import("windows_job.zig");
 
 const Allocator = std.mem.Allocator;
 pub const CommandOutputStream = command_contract.CommandOutputStream;
@@ -2302,13 +2303,14 @@ const ProcessObserver = struct {
     stdout: std.Io.File,
     stderr: std.Io.File,
     detached_pipes: bool = false,
+    /// Stands in for the process group on Windows.
+    tree: if (builtin.os.tag == .windows) ?windows_job.Tree else void,
 
     fn init(child: *std.process.Child) !ProcessObserver {
         const process_id = child.id orelse return error.SpawnFailed;
         const stdout = child.stdout orelse return error.SpawnFailed;
         const stderr = child.stderr orelse return error.SpawnFailed;
-        const detached_pipes = comptime builtin.os.tag != .windows and
-            builtin.os.tag != .wasi;
+        const detached_pipes = comptime builtin.os.tag != .wasi;
         if (detached_pipes) {
             child.stdout = null;
             child.stderr = null;
@@ -2319,6 +2321,7 @@ const ProcessObserver = struct {
             .stdout = stdout,
             .stderr = stderr,
             .detached_pipes = detached_pipes,
+            .tree = if (comptime builtin.os.tag == .windows) windows_job.Tree.init(process_id) else {},
         };
     }
 
@@ -2327,16 +2330,26 @@ const ProcessObserver = struct {
             self.stdout.close(self.waiter.io);
             self.stderr.close(self.waiter.io);
         }
+        if (comptime builtin.os.tag == .windows) {
+            if (self.tree) |tree| tree.deinit();
+        }
         self.* = undefined;
     }
 
+    /// Stops every process the command started, as the process group kill
+    /// does on POSIX.
+    fn terminateTree(self: *ProcessObserver) void {
+        if (comptime builtin.os.tag != .windows) return;
+        if (self.tree) |tree| tree.terminate();
+    }
+
     fn start(self: *ProcessObserver) !void {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+        if (comptime builtin.os.tag == .wasi) return;
         try self.waiter.start();
     }
 
     fn observe(self: *ProcessObserver) ?command_contract.CommandStatus {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+        if (comptime builtin.os.tag == .wasi) return null;
         if (!self.waiter.isReady()) return null;
         const term = self.waiter.awaitReady() catch |err| {
             return indeterminateStatus(err);
@@ -2348,7 +2361,7 @@ const ProcessObserver = struct {
         self: *ProcessObserver,
         source: TerminationSource,
     ) !command_contract.CommandStatus {
-        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (comptime builtin.os.tag != .wasi) {
             self.waiter.awaitDiscard();
             return self.observe().?;
         }
@@ -2408,7 +2421,11 @@ const ProcessObserver = struct {
         protocol: TerminationProtocol,
         intent: TerminationIntent,
     ) !void {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        if (comptime builtin.os.tag == .windows) {
+            self.terminateTree();
+            return;
+        }
+        if (comptime builtin.os.tag == .wasi) {
             self.waiter.child.kill(self.waiter.io);
             return;
         }
@@ -2421,8 +2438,13 @@ const ProcessObserver = struct {
     }
 
     fn abort(self: *ProcessObserver, process_group_id: ?std.posix.pid_t) void {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        if (comptime builtin.os.tag == .wasi) {
             cleanupChild(self.waiter.child);
+            return;
+        }
+        if (comptime builtin.os.tag == .windows) {
+            self.terminateTree();
+            self.waiter.awaitDiscard();
             return;
         }
         if (self.waiter.isReady()) {
@@ -2494,6 +2516,7 @@ fn collectOutput(
                     const drain: NaturalDrain = .{ .completed_ms = observer.waiter.completed_ms };
                     emitter.live_until_ms = drain.liveUntilMs(deadline_ms);
                     natural_drain = drain;
+                    observer.terminateTree();
                 }
                 if (process_group_id) |pid| {
                     if (source.* == .natural) {
@@ -2794,7 +2817,7 @@ fn waitForCollectedProcess(
     leader_status: ?command_contract.CommandStatus,
 ) !command_contract.CommandStatus {
     if (leader_status) |status| {
-        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (comptime builtin.os.tag != .wasi) {
             observer.waiter.awaitDiscard();
         }
         return status;
