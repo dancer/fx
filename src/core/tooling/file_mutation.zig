@@ -619,7 +619,16 @@ fn applyWithTestControls(
         commit_parent,
         target_name,
         io_mod.getIo(),
-    ) catch return resources.reject(.io_failure);
+    ) catch |err| {
+        if (!overwriteHeldTarget(
+            commit_parent,
+            target_name,
+            prepared.policy_targets.items[0].expected_identity,
+            prepared.after_content,
+            err,
+        )) return resources.reject(.io_failure);
+        resources.cleanupTemp();
+    };
     resources.temp_name = null;
     resources.temp_identity = null;
     resources.closeParent();
@@ -627,6 +636,38 @@ fn applyWithTestControls(
     handoff.tracker.committed_at_ms = io_mod.milliTimestamp();
     handoff_owned = false;
     return .{ .committed = handoff };
+}
+
+/// Windows refuses to rename over a file that another process holds open
+/// without delete sharing, which editors and Office apps commonly do. When
+/// that holder still allows writes, the verified target is rewritten in
+/// place; this gives up atomicity only where the rename was impossible.
+fn overwriteHeldTarget(
+    parent: std.Io.Dir,
+    name: []const u8,
+    expected_identity: ?file_mutation_contract.FileIdentity,
+    content: []const u8,
+    rename_error: anyerror,
+) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    if (rename_error != error.Unexpected and rename_error != error.AccessDenied) return false;
+    const expected = expected_identity orelse return false;
+    const zio = io_mod.getIo();
+    var file = parent.openFile(zio, name, .{
+        .mode = .read_write,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch return false;
+    defer file.close(zio);
+    const stat = file.stat(zio) catch return false;
+    if (stat.kind != .file) return false;
+    const device = pathing.descriptorDevice(file.handle) catch return false;
+    if (!identityEql(pathing.fileIdentity(device, stat), expected)) return false;
+    file.writePositionalAll(zio, content, 0) catch return false;
+    file.setLength(zio, content.len) catch return false;
+    file.sync(zio) catch return false;
+    return true;
 }
 
 fn preparedCommitClaim(prepared: PreparedFileMutation) *CommitClaim {
