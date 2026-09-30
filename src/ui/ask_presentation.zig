@@ -291,7 +291,7 @@ pub const Runtime = struct {
     }
 
     fn writeTerminalBytes(self: *Runtime, bytes: []const u8) !void {
-        try self.shell.stdoutFile().writeStreamingAll(io_mod.getIo(), bytes);
+        try self.shell.stdout_file.writeStreamingAll(io_mod.getIo(), bytes);
         self.metrics.ansi_bytes += bytes.len;
         if (self.shell.shadow_vt) |shadow| try shadow.feed(bytes);
     }

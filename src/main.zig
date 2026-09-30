@@ -512,7 +512,7 @@ const App = struct {
     }
 
     pub fn terminalTitle(self: *const Self) host.TerminalTitle {
-        return ui_render.terminalTitleFor(&self.shell.stdoutFile());
+        return ui_render.terminalTitleFor(&self.shell.stdout_file);
     }
 
     alloc: Allocator,

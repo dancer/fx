@@ -4255,9 +4255,12 @@ test "render diagnostic commit skips unchanged same-row paints" {
 }
 
 pub const TranscriptRuntime = struct {
-    /// Null writes to the process stdout, whose handle Windows only exposes
-    /// at runtime; read it through `stdoutFile`.
-    stdout_file: ?std.Io.File = null,
+    /// Windows only exposes the process stdout at runtime, so interactive
+    /// bootstrap replaces this placeholder there.
+    stdout_file: std.Io.File = if (@import("builtin").os.tag == .windows)
+        .{ .handle = std.os.windows.INVALID_HANDLE_VALUE, .flags = .{ .nonblocking = false } }
+    else
+        std.Io.File.stdout(),
     test_frame_sink: if (@import("builtin").is_test) ?render_engine.terminal_diff.FrameSink else void = if (@import("builtin").is_test) null else {},
     sync_updates_enabled: bool = true,
     history_reset_uses_ris: bool = false,
@@ -4444,10 +4447,6 @@ pub const TranscriptRuntime = struct {
         }
         result.compact_transcript_source_cache.next_replacement = 0;
         return result;
-    }
-
-    pub fn stdoutFile(self: *const TranscriptRuntime) std.Io.File {
-        return self.stdout_file orelse std.Io.File.stdout();
     }
 
     pub fn enableShadowVt(self: *TranscriptRuntime, alloc: Allocator) !void {
