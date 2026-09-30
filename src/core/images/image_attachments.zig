@@ -10,6 +10,7 @@ const io_mod = @import("../shared/io.zig");
 const png_downscale = @import("png_downscale.zig");
 const types = @import("../shared/types.zig");
 const pathing = @import("../workspace/pathing.zig");
+const windows_clipboard = @import("../hosts/windows_clipboard.zig");
 
 pub const max_image_bytes: usize = 20 * 1024 * 1024;
 const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
@@ -2202,7 +2203,7 @@ pub const ClipboardImageAttachment = struct {
 };
 
 pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAttachment {
-    if (builtin.os.tag != .macos) return error.Unsupported;
+    if (builtin.os.tag != .macos and builtin.os.tag != .windows) return error.Unsupported;
 
     const source_dir = try createTempSnapshotDir(alloc);
     errdefer {
@@ -2211,6 +2212,21 @@ pub fn loadClipboardImageAttachment(alloc: std.mem.Allocator) !ClipboardImageAtt
     }
     const temp_path = try std.fs.path.join(alloc, &.{ source_dir, "clipboard.png" });
     defer alloc.free(temp_path);
+
+    if (comptime builtin.os.tag == .windows) {
+        const png = try windows_clipboard.readImagePng(alloc) orelse return error.NoClipboardImage;
+        defer alloc.free(png);
+        {
+            const zio = io_mod.getIo();
+            var file = try std.Io.Dir.cwd().createFile(zio, temp_path, .{ .exclusive = true });
+            defer file.close(zio);
+            try file.writeStreamingAll(zio, png);
+        }
+        return .{
+            .attachment = try loadImageAttachment(alloc, temp_path),
+            .source_dir = source_dir,
+        };
+    }
 
     const write_script = try std.fmt.allocPrint(
         alloc,
