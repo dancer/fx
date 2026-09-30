@@ -51,6 +51,7 @@ const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
 const runtime_vision_contracts = @import("vision_contracts.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
+const image_data = @import("../../images/image_data.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
@@ -2629,6 +2630,55 @@ fn prepareAvailabilityTerminal(
     };
 }
 
+/// Advertises live MCP tools the model called without loading them first, so
+/// those calls reach normal validation and MCP permission instead of failing
+/// as unselected. Names that do not resolve, including lookups that fail or
+/// are cancelled, keep the unsupported-tool path, where the turn's normal
+/// cancellation handling still applies.
+fn advertiseUnselectedMcpCalls(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    calls: []const ToolCall,
+    selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
+    advertised_tools: *[]const agent_stream_provider.DynamicFunctionTool,
+    advertised_names: *[][]const u8,
+) !void {
+    const resolve = deps.resolve_unselected_mcp_tool orelse return;
+    for (calls) |call| {
+        if (deps.tool_registry.lookup(call.name) != null) continue;
+        if (containsToolName(advertised_names.*, call.name)) continue;
+        const resolved = resolve(deps.ctx, arena, call.name) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                debug_trace.logf("mcp", "unselected MCP tool lookup failed tool={s} err={s}", .{ call.name, @errorName(err) });
+                continue;
+            },
+        };
+        const definition = resolved orelse continue;
+        if (!std.mem.eql(u8, definition.name, call.name) or definition.mcp_binding == null) continue;
+        try runtime_gateway_step.recordSelectedDynamicTool(arena, selected, definition);
+        const tool = for (selected.items) |item| {
+            if (std.mem.eql(u8, item.name, call.name)) break item;
+        } else unreachable;
+        const tools = try arena.alloc(agent_stream_provider.DynamicFunctionTool, advertised_tools.len + 1);
+        @memcpy(tools[0..advertised_tools.len], advertised_tools.*);
+        tools[advertised_tools.len] = tool;
+        const names = try arena.alloc([]const u8, advertised_names.len + 1);
+        @memcpy(names[0..advertised_names.len], advertised_names.*);
+        names[advertised_names.len] = tool.name;
+        advertised_tools.* = tools;
+        advertised_names.* = names;
+        debug_trace.logf("mcp", "loaded unselected MCP tool for direct call tool={s}", .{call.name});
+    }
+}
+
+fn containsToolName(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
 fn prepareDeferredDynamicCandidate(
     raw_ctx: ?*anyopaque,
     alloc: Allocator,
@@ -3244,7 +3294,7 @@ fn finishPendingParallelCancelled(
             // parallel run is deinitialized after this scope, while history
             // keeps prepared.memory.
             prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
-            try runtime_execution_memory.retainToolImages(arena, config, call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, provisional_alloc, config, call, &prepared);
             _ = try provisional_statuses.finishExecutedCall(
                 deps,
                 provisional_alloc,
@@ -6966,6 +7016,10 @@ fn processQueuedPromptLoop(
         selected_fast_mode;
     var fast_unavailable_notified = false;
     var tool_image_strip_notified = false;
+    var attachment_withheld_notified = false;
+    // Attachment pixel sizes probed during this turn, so each step does not
+    // reread every attachment snapshot. Entries live in the turn arena.
+    var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
     var semantic_attempt: usize = if (selection_changed or restored_budget_exhausted)
         0
     else
@@ -7113,8 +7167,8 @@ fn processQueuedPromptLoop(
             restore_recovery_source = false;
         }
 
-        const advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
-        const advertised_dynamic_tool_names = try arena.alloc([]const u8, advertised_dynamic_tools.len);
+        var advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
+        var advertised_dynamic_tool_names = try arena.alloc([]const u8, advertised_dynamic_tools.len);
         for (advertised_dynamic_tools, 0..) |tool, index| advertised_dynamic_tool_names[index] = tool.name;
         var stream_result: runtime_gateway_step.StreamResult = undefined;
         var stream_result_set = false;
@@ -7335,7 +7389,32 @@ fn processQueuedPromptLoop(
                     break;
                 }
             }
-            const materialized_messages = if (request_capabilities.image_input_support == .native) try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages) else result_request_messages;
+            const materialized_messages = if (request_capabilities.image_input_support == .native) native: {
+                const projection = try image_attachments.withholdOversizedAttachments(
+                    overlay_arena,
+                    arena,
+                    &attachment_dimensions,
+                    try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages),
+                );
+                // The model gets a note for each withheld attachment. The user
+                // hears about ones attached this turn, once per turn.
+                var withheld_now: usize = 0;
+                for (projection.withheld_ids) |id| {
+                    for (job.images) |image| {
+                        if (image.id == id) withheld_now += 1;
+                    }
+                }
+                if (withheld_now > 0 and !attachment_withheld_notified) {
+                    attachment_withheld_notified = true;
+                    const limit = image_data.max_image_dimension;
+                    try deps.push_text(deps.ctx, .{ .operational = if (withheld_now == 1)
+                        std.fmt.comptimePrint("An attached image is over {d} pixels per side and fx can't downscale it here, so the model gets a note about it instead of the image.", .{limit})
+                    else
+                        std.fmt.comptimePrint("Some attached images are over {d} pixels per side and fx can't downscale them here, so the model gets a note about them instead of the images.", .{limit}) });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                }
+                break :native projection.messages;
+            } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
             const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
             if (request_messages.ptr != image_projection.messages.ptr) {
@@ -9615,6 +9694,14 @@ fn processQueuedPromptLoop(
             }
         }
 
+        try advertiseUnselectedMcpCalls(
+            deps,
+            arena,
+            completion.tool_calls,
+            &selected_dynamic_tools,
+            &advertised_dynamic_tools,
+            &advertised_dynamic_tool_names,
+        );
         const prepared_tool_calls = try arena.alloc(
             PreparedToolCall,
             completion.tool_calls.len,
@@ -11947,7 +12034,7 @@ fn processQueuedPromptLoop(
                 &prepared.memory,
                 execution.tool_result_memory,
             );
-            try runtime_execution_memory.retainToolImages(arena, config, tool_call, &prepared);
+            try runtime_execution_memory.retainToolImages(arena, stream_ctx.alloc, config, tool_call, &prepared);
             runtime_execution_memory.finalizeCommandReplay(
                 arena,
                 tool_call,

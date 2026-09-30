@@ -574,6 +574,9 @@ pub const WorkerRuntime = struct {
     recovery_continuation_ready: bool = false,
     /// When true, queued work will not start.
     turn_start_held: bool = false,
+    /// Independent of a pending submission's turn-start hold; protects queued
+    /// work until a fresh-session scrollback handoff succeeds or is cancelled.
+    session_transition_held: bool = false,
     next_permission_request_id: u64 = 1,
     pending_permission_response: ?permission_request.OwnedPermissionResponse = null,
     pending_permission_request_shared: ?permission_request.OwnedPermissionRequest = null,
@@ -1269,11 +1272,27 @@ pub const WorkerRuntime = struct {
         return messages;
     }
 
+    pub fn holdSessionTransition(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.session_transition_held = true;
+    }
+
+    pub fn releaseSessionTransitionHold(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.session_transition_held) return;
+        self.session_transition_held = false;
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
     /// Hold turn admission only when no turn is active or queued.
     pub fn tryHoldTurnStart(self: *WorkerRuntime) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.worker_processing or self.queuedWorkCountLocked() > 0 or self.turn_start_held) {
+        if (self.worker_processing or self.queuedWorkCountLocked() > 0 or
+            self.turn_start_held or self.session_transition_held)
+        {
             return false;
         }
         self.turn_start_held = true;
@@ -1372,7 +1391,7 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
-        while ((self.queued_prompts.items.len == 0 or self.turn_start_held) and
+        while ((self.queued_prompts.items.len == 0 or self.turn_start_held or self.session_transition_held) and
             !self.worker_stop_requested)
         {
             self.worker_processing = false;
@@ -1388,8 +1407,8 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
 
         while (((self.queued_prompts.items.len == 0 and
-            self.queued_context_compaction == null) or self.turn_start_held) and
-            !self.worker_stop_requested)
+            self.queued_context_compaction == null) or self.turn_start_held or
+            self.session_transition_held) and !self.worker_stop_requested)
         {
             self.worker_processing = false;
             self.active_turn_id = 0;
@@ -1405,7 +1424,7 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (self.queued_prompts.items.len == 0 or
-            self.turn_start_held or
+            self.turn_start_held or self.session_transition_held or
             self.worker_stop_requested)
         {
             return null;
@@ -1418,7 +1437,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         if ((self.queued_prompts.items.len == 0 and
             self.queued_context_compaction == null) or self.turn_start_held or
-            self.worker_stop_requested)
+            self.session_transition_held or self.worker_stop_requested)
         {
             return null;
         }
@@ -7335,4 +7354,20 @@ test "discarding queued recovery releases metadata without deleting saved images
     runtime.clearQueuedPrompts(alloc, &.{});
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
     try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
+}
+
+test "session transition hold keeps an existing queued prompt until released" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "test/model"));
+    runtime.holdSessionTransition();
+    try std.testing.expect(!runtime.tryHoldTurnStart());
+    try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+    runtime.releaseSessionTransitionHold();
+    const prompt = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, prompt);
+    try std.testing.expectEqualStrings("queued", prompt.prompt);
+    try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
 }

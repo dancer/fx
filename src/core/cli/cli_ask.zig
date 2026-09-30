@@ -294,6 +294,10 @@ pub const PromptRunResult = struct {
     exit_code: u8,
     assistant_output: []u8,
     final_output: []u8 = &.{},
+    /// Owned raw text of the completed final response as saved to history,
+    /// with its Markdown intact; empty when absent. Unlike `final_output`, it
+    /// never includes display-only text.
+    final_source: []u8 = &.{},
     interrupted: bool = false,
     model: []u8 = &.{},
     session_id: []u8 = &.{},
@@ -311,6 +315,7 @@ pub const PromptRunResult = struct {
     pub fn deinit(self: PromptRunResult, alloc: Allocator) void {
         alloc.free(self.assistant_output);
         if (self.final_output.len > 0) alloc.free(self.final_output);
+        if (self.final_source.len > 0) alloc.free(self.final_source);
         if (self.model.len > 0) alloc.free(self.model);
         if (self.resolved_provider.len > 0) alloc.free(self.resolved_provider);
         if (self.session_id.len > 0) alloc.free(self.session_id);
@@ -418,8 +423,9 @@ const PermissionApprovalPromptResult = enum {
 const NotifyAttentionFn = *const fn (?*anyopaque) void;
 const PermissionApprovalPromptFn = *const fn (?*anyopaque, ?*anyopaque, WriteFn, []const u8, ?*anyopaque, NotifyAttentionFn) anyerror!PermissionApprovalPromptResult;
 const IsTtyFn = *const fn (?*anyopaque) bool;
-const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
-const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
+/// The final `?[]const u8` is the run's --model, which stands in for a provider without a saved model.
+const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, ?[]const u8) anyerror!app_lifecycle.StartupState;
+const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode, ?[]const u8) anyerror!app_lifecycle.StartupState;
 const InitializeSessionStoresFn = *const fn (*AskContext) anyerror!void;
 const LoadSkillsFn = *const fn (
     Allocator,
@@ -442,7 +448,7 @@ const RunDeps = struct {
     stdout_is_tty: IsTtyFn = realStdoutIsTty,
     stderr_is_tty: IsTtyFn = realStderrIsTty,
     load_startup_state: LoadStartupStateFn = loadStartupStateDefault,
-    load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
+    load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateForRun,
     initialize_session_stores: InitializeSessionStoresFn = initializeSessionStoresDefault,
     load_skills: LoadSkillsFn = app_runtime_setup.loadSkills,
     context_registry: context_contract.Registry,
@@ -619,6 +625,7 @@ const AskContext = struct {
     command_output_line_open: bool = false,
     assistant_output: std.ArrayList(u8) = .empty,
     final_output: std.ArrayList(u8) = .empty,
+    final_source: std.ArrayList(u8) = .empty,
     tool_call_records: std.ArrayList(ToolCallRecord) = .empty,
     tool_call_records_mutex: std.Io.Mutex = .init,
     web_search_progress_mutex: std.Io.Mutex = .init,
@@ -785,6 +792,7 @@ const AskContext = struct {
         }
         self.assistant_output.deinit(self.alloc);
         self.final_output.deinit(self.alloc);
+        self.final_source.deinit(self.alloc);
         for (self.pending_tool_progress.items) |progress| progress.deinit(self.alloc);
         self.pending_tool_progress.deinit(self.alloc);
         for (self.deferred_tool_progress.items) |progress| self.alloc.free(progress);
@@ -1201,7 +1209,7 @@ fn freshAskState(
 
 pub fn run(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_registry: context_contract.Registry, tool_set: tool_set_contract.ToolSet) !u8 {
     return runWithDeps(alloc, args, cfg, .{
-        .load_startup_state = app_lifecycle.loadStartupState,
+        .load_startup_state = loadStartupStateDefault,
         .context_registry = context_registry,
         .tool_set = tool_set,
         .load_mcp_runtime = cfg.load_mcp_runtime,
@@ -1243,6 +1251,7 @@ fn writeAskUsage(deps: RunDeps, usage: []const u8) !void {
 
 fn askErrorNotice(err: anyerror) ?[]const u8 {
     if (auth_runtime.preparationFailureNotice(err)) |notice| return notice;
+    if (config_runtime.modelNotSelectedMessage(err)) |message| return message;
     return switch (err) {
         error.ImagePreparationFailed => image_attachments.image_preparation_failed_notice,
         error.ModelImageCapabilityUnavailable => image_attachments.model_image_capability_unavailable_notice,
@@ -1499,6 +1508,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.default_model,
             cfg.default_agent_step_limit,
             cfg.auth_mode,
+            options.model_override,
         )
     else
         try options.deps.load_startup_state(
@@ -1507,6 +1517,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             cfg.secret_store,
             cfg.default_model,
             cfg.default_agent_step_limit,
+            options.model_override,
         );
     defer startup.deinit(alloc);
     applyAskThemeChoice(startup.theme);
@@ -2050,6 +2061,11 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     else
         @constCast(&.{});
     errdefer if (final_output.len > 0) alloc.free(final_output);
+    const final_source: []u8 = if (ctx.final_source.items.len > 0)
+        try alloc.dupe(u8, ctx.final_source.items)
+    else
+        @constCast(&.{});
+    errdefer if (final_source.len > 0) alloc.free(final_source);
     const model = try alloc.dupe(u8, ctx.model);
     errdefer alloc.free(model);
     const resolved_provider: []u8 = if (ctx.resolved_provider) |provider|
@@ -2069,6 +2085,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .exit_code = if (ctx.failed) 1 else 0,
         .assistant_output = assistant_output,
         .final_output = final_output,
+        .final_source = final_source,
         .interrupted = ctx.processInterruptRequested(),
         .model = model,
         .resolved_provider = resolved_provider,
@@ -3212,6 +3229,7 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
         },
         .finish_prompt => |finished| {
             ctx.final_output.clearRetainingCapacity();
+            ctx.final_source.clearRetainingCapacity();
             if (finished.terminal_outcome == .completed) switch (finished.turn) {
                 .assistant => |turn| {
                     const presentation = @import("../agent/runtime/assistant_stream.zig");
@@ -3219,6 +3237,7 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
                     const normalized = try presentation.normalizeAssistantTextForDisplay(ctx.alloc, text);
                     defer ctx.alloc.free(normalized);
                     try ctx.final_output.appendSlice(ctx.alloc, presentation.textForCompletedPresentation(text, normalized));
+                    try ctx.final_source.appendSlice(ctx.alloc, turn.assistant);
                 },
                 .compacted_summary, .interrupted => {},
             };
@@ -4280,13 +4299,16 @@ fn loadStartupStateDefault(
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
+    model_override: ?[]const u8,
 ) !app_lifecycle.StartupState {
-    return app_lifecycle.loadStartupState(
+    return app_lifecycle.loadStartupStateForRun(
         alloc,
         transport,
         secret_store,
         default_model,
         default_agent_step_limit,
+        .local,
+        model_override,
     );
 }
 
@@ -4490,7 +4512,7 @@ fn testConfig() Config {
     };
 }
 
-fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx-test");
@@ -4499,7 +4521,7 @@ fn testMissingKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.
     return state;
 }
 
-fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
     var state = app_lifecycle.StartupState{ .agent_step_limit = default_agent_step_limit };
     errdefer state.deinit(alloc);
     state.workspace_root = try alloc.dupe(u8, "/tmp/fx-test");
@@ -4512,14 +4534,14 @@ fn testPresentKeyStartup(alloc: Allocator, _: oauth_transport.Provider, _: host.
     return state;
 }
 
-fn testMissingKeyAcknowledgedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testMissingKeyAcknowledgedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
+    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
     state.yolo_acknowledged = true;
     return state;
 }
 
-fn testMissingKeyDiagnosticStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testMissingKeyDiagnosticStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
+    var state = try testMissingKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
     errdefer state.deinit(alloc);
     state.config_diagnostics = try alloc.alloc(config_runtime.ConfigDiagnostic, 1);
     state.config_diagnostics[0] = .{
@@ -4529,8 +4551,8 @@ fn testMissingKeyDiagnosticStartup(alloc: Allocator, transport: oauth_transport.
     return state;
 }
 
-fn testPresentKeySavedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testPresentKeySavedStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
+    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
     errdefer state.deinit(alloc);
     state.configured_model = try alloc.dupe(u8, default_model);
     return state;
@@ -4753,9 +4775,9 @@ var test_initialize_session_store_calls: usize = 0;
 var test_image_preflight_startup_calls: usize = 0;
 var test_image_preflight_process_calls: usize = 0;
 
-fn testCountImagePreflightStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
+fn testCountImagePreflightStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
     test_image_preflight_startup_calls += 1;
-    return testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+    return testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
 }
 
 fn testCountImagePreflightProcess(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
@@ -4859,8 +4881,8 @@ fn testLoadTruncatedSkillsWithDiagnostic(
     };
 }
 
-fn testPresentKeyTruncatedSkillCatalogStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testPresentKeyNoContextStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testPresentKeyTruncatedSkillCatalogStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
+    var state = try testPresentKeyNoContextStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
     state.context_limits.skill_catalog_bytes = .{
         .value = .{ .bytes = 0 },
         .source = .command_line,
@@ -5033,8 +5055,8 @@ const test_cli_context_registry = context_contract.Registry{ .default_provider =
     .append_transient_fn = TestContextRegistryFixture.appendTransient,
 } };
 
-fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize) !app_lifecycle.StartupState {
-    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit);
+fn testPresentKeyNoContextStartup(alloc: Allocator, transport: oauth_transport.Provider, secret_store: host.SecretStore, default_model: []const u8, default_agent_step_limit: usize, _: ?[]const u8) !app_lifecycle.StartupState {
+    var state = try testPresentKeyStartup(alloc, transport, secret_store, default_model, default_agent_step_limit, null);
     state.context_enabled = false;
     return state;
 }
@@ -6242,6 +6264,7 @@ fn testLoadStartupStateWithCancellation(
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
+    _: ?[]const u8,
 ) !app_lifecycle.StartupState {
     const state = try testPresentKeyStartup(
         alloc,
@@ -6249,6 +6272,7 @@ fn testLoadStartupStateWithCancellation(
         secret_store,
         default_model,
         default_agent_step_limit,
+        null,
     );
     if (test_startup_cancellation_stage == .after_startup_state) {
         requestTestHeadlessInterrupt();
@@ -9735,7 +9759,57 @@ test "CLI final output admits only completed assistant finish prompts" {
         const owned = try types.dupeFinishedPrompt(std.heap.c_allocator, source);
         try deps.push_event(deps.ctx, .{ .finish_prompt = owned });
         try std.testing.expectEqual(@as(usize, 0), ctx.final_output.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.final_source.items.len);
     }
+}
+
+test "CLI final source keeps only the completed response with its Markdown" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+    const deps = agentRuntimeDeps(&ctx);
+
+    const draft = "Add note probe\n\n## Summary\n\n- Uses **bold** and `inline code`.";
+    try deps.push_text(deps.ctx, .assistant_started);
+    try deps.push_text(deps.ctx, .{ .assistant_source = "Let me check the note first." });
+    try deps.push_text(deps.ctx, .assistant_started);
+    try deps.push_text(deps.ctx, .{ .assistant_source = draft });
+    const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast(draft),
+        } },
+        .terminal_outcome = .completed,
+    });
+    try deps.push_event(deps.ctx, .{ .finish_prompt = finished });
+
+    const result = try takePromptRunResult(&ctx, alloc);
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, result.assistant_output, "Let me check the note first."));
+    try std.testing.expectEqualStrings(draft, result.final_source);
+    try std.testing.expectEqualStrings("Add note probe\n\n## Summary\n\n- Uses bold and inline code.", result.final_output);
+
+    const displayed = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast(draft),
+        } },
+        .presentation_text = "Earlier candidate.\n\n" ++ draft,
+        .terminal_outcome = .completed,
+    });
+    try deps.push_event(deps.ctx, .{ .finish_prompt = displayed });
+    try std.testing.expectEqualStrings(draft, ctx.final_source.items);
+    try std.testing.expect(std.mem.startsWith(u8, ctx.final_output.items, "Earlier candidate."));
 }
 
 test "CLI command output completion terminates only an open display line" {

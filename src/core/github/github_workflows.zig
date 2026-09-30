@@ -86,7 +86,6 @@ test "pull request prompt preserves active context and section contract" {
     try expectContains(prompt, "Git snapshot\nBranch: feature\n");
     try expectContains(prompt, "## Summary");
     try expectContains(prompt, "## Testing");
-    try expectContains(prompt, "a plain-text title line without Markdown");
     try expectNotContains(prompt, "## Steps to Reproduce");
     try expectContains(prompt, "Do not create the PR with gh or publish anything unless I explicitly ask you to.");
 }
@@ -111,7 +110,20 @@ test "issue prompt works outside git and omits empty context clause" {
     try expectContains(prompt, "## Steps to Reproduce");
     try expectContains(prompt, "## Expected");
     try expectContains(prompt, "## Actual");
-    try expectContains(prompt, "a plain-text title line without Markdown");
     try expectNotContains(prompt, "Additional context:");
     try expectContains(prompt, "Do not create the issue with gh or publish anything unless I explicitly ask you to.");
+}
+
+test "every draft prompt asks for a plain-text title line" {
+    for ([_]Workflow{ .pull_request, .issue }) |workflow| {
+        for ([_][]const u8{ "", "ready for review" }) |context| {
+            const prompt = try buildPromptFromSnapshot(std.testing.allocator, workflow, ConversationLanguage.default(), context, .{
+                .in_git_repo = true,
+                .text = "Git snapshot\nBranch: feature\n",
+            });
+            defer std.testing.allocator.free(prompt);
+
+            try expectContains(prompt, "Return only: a plain-text title line without Markdown, a blank line, then");
+        }
+    }
 }

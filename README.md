@@ -56,6 +56,9 @@ fx ask "explain the changes in this repository"
 
 Inside the shell, run `/help` to browse interactive commands.
 
+In tmux, use your usual prefix bindings to switch sessions or enter copy mode.
+fx preserves those tmux views while resizing, including when the switcher zooms a split pane.
+
 ## Documentation
 
 Visit [fx.sh/docs](https://fx.sh/docs) for the full manual: sessions, models, custom model connections, permissions, configuration, skills, MCP, subagents, embedding, and the complete CLI and slash command references. Agents can read any page as Markdown by appending `.md` to its URL, or fetch [llms-full.txt](https://fx.sh/llms-full.txt) for everything in one file.
@@ -106,6 +109,8 @@ fx builds as a native binary or WebAssembly. Applications embedding fx can provi
 | `fx acp` | Connect the native agent to editors and other Agent Client Protocol clients. |
 | `createFxAgent()` | Embed the agent core in a JavaScript host with `fx-core.wasm`. |
 | `createFxTerminal()` | Embed the interactive terminal with `fx-term.wasm`. |
+
+ACP clients can keep their MCP tools loaded on every turn, steer a running turn, supply a session system prompt, serve MCP servers over the ACP connection, and choose each session's workspace. See [ACP embedding](CONTRIBUTING.md#acp-embedding).
 
 The SDK is published to npm as [libfx](https://www.npmjs.com/package/libfx). See the [WebAssembly SDK](sdk/README.md) and the runnable Node.js, browser, Next.js, and Nuxt [examples](examples/README.md). The WebAssembly SDK is experimental.
 
