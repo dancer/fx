@@ -100,7 +100,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_windows_smoke = b.addRunArtifact(windows_smoke);
-    run_windows_smoke.addArgs(&.{ b.pathJoin(&.{ b.cache_root.path orelse ".", "windows-smoke" }), "files", "commands" });
+    run_windows_smoke.addArgs(&.{ b.pathJoin(&.{ b.cache_root.path orelse ".", "windows-smoke" }), "files", "commands", "web" });
     const run_windows_powershell_smoke = b.addRunArtifact(windows_smoke);
     run_windows_powershell_smoke.setEnvironmentVariable("FX_WINDOWS_SHELL", "powershell");
     run_windows_powershell_smoke.addArgs(&.{ b.pathJoin(&.{ b.cache_root.path orelse ".", "windows-smoke-powershell" }), "commands" });

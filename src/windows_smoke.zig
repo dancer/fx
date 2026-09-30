@@ -21,6 +21,8 @@ const command_contract = @import("core/execution/command_contract.zig");
 const command_environment = @import("core/execution/command_environment.zig");
 const shell_resolver = @import("core/terminal/shell_resolver.zig");
 const windows_shell = @import("core/execution/windows_shell.zig");
+const http_fetch = @import("tools/web/http_fetch.zig");
+const url_policy = @import("tools/web/url_policy.zig");
 
 pub const std_options_FilePermissions: ?type = if (builtin.os.tag == .windows) windows_io.Permissions else null;
 
@@ -137,6 +139,28 @@ const Smoke = struct {
         return self.alloc.dupe(u8, bytes) catch @panic("OOM");
     }
 
+    fn expectFetch(self: *Smoke, label: []const u8, url: []const u8, final_prefix: []const u8, cancelled: bool) !void {
+        var target = try url_policy.normalize(self.alloc, url);
+        defer target.deinit(self.alloc);
+        var cancel = std.atomic.Value(bool).init(cancelled);
+        var result = http_fetch.fetch(self.alloc, target, .{ .cancel_flag = &cancel }, http_fetch.defaultTransport()) catch |err| {
+            if (cancelled and err == error.Canceled) return print("ok    {s}", .{label});
+            return self.fail(label, "a response", @errorName(err));
+        };
+        defer result.deinit(self.alloc);
+        if (cancelled) return self.fail(label, "Canceled", @tagName(result));
+        switch (result) {
+            .success => |success| {
+                if (success.status != .ok) return self.fail(label, "200", @tagName(success.status));
+                if (!std.mem.startsWith(u8, success.final_url, final_prefix)) return self.fail(label, final_prefix, success.final_url);
+                if (success.body.len == 0) return self.fail(label, "a body", "empty");
+                print("ok    {s} ({d} bytes)", .{ label, success.body.len });
+            },
+            .failure => |failure| self.fail(label, "success", @tagName(failure.kind)),
+            .cross_host_redirect => |next| self.fail(label, "success", next),
+        }
+    }
+
     fn expectAbsent(self: *Smoke, label: []const u8, relative: []const u8) void {
         if (self.read(relative)) |content| {
             return self.fail(label, "no file", content);
@@ -202,6 +226,12 @@ pub fn main(init: std.process.Init) !void {
             failures += try runFileChecks(alloc, base);
         } else if (std.mem.eql(u8, group, "commands")) {
             failures += try runCommandChecks(alloc, base);
+        } else if (std.mem.eql(u8, group, "web")) {
+            var smoke: Smoke = .{ .alloc = alloc, .root = base };
+            try smoke.expectFetch("fetch https", "https://github.com/", "https://github.com", false);
+            try smoke.expectFetch("fetch http redirect to https", "http://github.com/", "https://github.com", false);
+            try smoke.expectFetch("fetch cancelled", "https://github.com/", "", true);
+            failures += smoke.failures;
         } else return error.UnknownCheckGroup;
     }
     if (failures != 0) {
