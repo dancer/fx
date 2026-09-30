@@ -1429,15 +1429,29 @@ fn derivePostimage(
 ) error{OutOfMemory}!PostimageResult {
     return switch (input) {
         .write => |write| .{
-            .content = try alloc.dupe(u8, write.content),
+            .content = switch (preimage) {
+                .present => |present| if (usesCrlfOnly(present.content) and
+                    std.mem.findScalar(u8, write.content, '\r') == null)
+                    try lfToCrlf(alloc, write.content)
+                else
+                    try alloc.dupe(u8, write.content),
+                .absent => try alloc.dupe(u8, write.content),
+            },
         },
-        .edit => |edit| blk: {
-            if (std.mem.eql(u8, edit.old_string, edit.new_string)) {
+        .edit => |raw_edit| blk: {
+            if (std.mem.eql(u8, raw_edit.old_string, raw_edit.new_string)) {
                 break :blk .{ .semantic_failure = "edit_file failed: old_string and new_string are identical" };
             }
             const before = switch (preimage) {
                 .absent => break :blk .{ .semantic_failure = identity_changed_message },
                 .present => |present| present.content,
+            };
+            const edit: EditStrings = if (usesCrlfOnly(before)) .{
+                .old_string = try lfToCrlf(alloc, raw_edit.old_string),
+                .new_string = try lfToCrlf(alloc, raw_edit.new_string),
+            } else .{
+                .old_string = raw_edit.old_string,
+                .new_string = raw_edit.new_string,
             };
             const occurrence_count = countOccurrences(before, edit.old_string);
             if (occurrence_count == 0) {
@@ -1480,6 +1494,41 @@ fn derivePostimage(
             break :blk .{ .content = after };
         },
     };
+}
+
+const EditStrings = struct {
+    old_string: []const u8,
+    new_string: []const u8,
+};
+
+/// Reports whether every line break in `text` is CRLF. Edit strings arrive
+/// LF-only, so files in this state get their line endings preserved.
+fn usesCrlfOnly(text: []const u8) bool {
+    var saw_line_break = false;
+    for (text, 0..) |byte, index| {
+        if (byte != '\n') continue;
+        if (index == 0 or text[index - 1] != '\r') return false;
+        saw_line_break = true;
+    }
+    return saw_line_break;
+}
+
+fn lfToCrlf(alloc: Allocator, text: []const u8) error{OutOfMemory}![]u8 {
+    var bare_count: usize = 0;
+    for (text, 0..) |byte, index| {
+        if (byte == '\n' and (index == 0 or text[index - 1] != '\r')) bare_count += 1;
+    }
+    const out = try alloc.alloc(u8, text.len + bare_count);
+    var out_index: usize = 0;
+    for (text, 0..) |byte, index| {
+        if (byte == '\n' and (index == 0 or text[index - 1] != '\r')) {
+            out[out_index] = '\r';
+            out_index += 1;
+        }
+        out[out_index] = byte;
+        out_index += 1;
+    }
+    return out;
 }
 
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
@@ -2131,6 +2180,65 @@ test "prepare hashes exact raw JSON bytes" {
         &prepared_a.arguments_hash,
         &prepared_b.arguments_hash,
     ));
+}
+
+test "prepare keeps CRLF line endings for LF-only edit strings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "crlf.txt", "one\r\ntwo\r\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "crlf-edit",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "crlf.txt", "one\ntwo", "one\nand\ntwo"),
+    };
+    const prepared = try expectPrepared(arena, call, try evaluatePolicy(arena, root, call));
+    try std.testing.expectEqualStrings("one\r\nand\r\ntwo\r\n", prepared.after_content);
+}
+
+test "prepare keeps CRLF when rewriting a CRLF file and LF for new files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "crlf.txt", "old\r\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const rewrite: types.ToolCall = .{
+        .id = "crlf-rewrite",
+        .name = "write_file",
+        .arguments_json = try writeArgumentsJson(arena, "crlf.txt", "a\nb\n"),
+    };
+    const rewritten = try expectPrepared(arena, rewrite, try evaluatePolicy(arena, root, rewrite));
+    try std.testing.expectEqualStrings("a\r\nb\r\n", rewritten.after_content);
+
+    const create: types.ToolCall = .{
+        .id = "lf-create",
+        .name = "write_file",
+        .arguments_json = try writeArgumentsJson(arena, "new.txt", "a\nb\n"),
+    };
+    const created = try expectPrepared(arena, create, try evaluatePolicy(arena, root, create));
+    try std.testing.expectEqualStrings("a\nb\n", created.after_content);
+}
+
+test "prepare matches mixed line endings exactly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try createFile(&tmp, "mixed.txt", "one\r\ntwo\nthree\n");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = try workspaceRoot(arena, tmp);
+    const call: types.ToolCall = .{
+        .id = "mixed-edit",
+        .name = "edit_file",
+        .arguments_json = try editArgumentsJson(arena, "mixed.txt", "two\nthree", "2\n3"),
+    };
+    const prepared = try expectPrepared(arena, call, try evaluatePolicy(arena, root, call));
+    try std.testing.expectEqualStrings("one\r\n2\n3\n", prepared.after_content);
 }
 
 test "prepare rejects call target and authority identity mismatches" {
