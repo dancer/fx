@@ -26,6 +26,7 @@ const windows_shell = @import("core/execution/windows_shell.zig");
 const http_fetch = @import("tools/web/http_fetch.zig");
 const url_policy = @import("tools/web/url_policy.zig");
 const windows_clipboard = @import("core/hosts/windows_clipboard.zig");
+const image_attachments = @import("core/images/image_attachments.zig");
 
 pub const std_options_FilePermissions: ?type = if (builtin.os.tag == .windows) windows_io.Permissions else null;
 
@@ -207,6 +208,22 @@ const Smoke = struct {
         print("ok    {s} ({d} ms)", .{ label, duration_ms });
     }
 
+    fn expectClipboardImage(self: *Smoke, label: []const u8, place: []const u8) !void {
+        _ = try readClipboard(self.alloc, place);
+        var loaded = image_attachments.loadClipboardImageAttachment(self.alloc) catch |err| return self.fail(label, "an attachment", @errorName(err));
+        defer loaded.deinit(self.alloc);
+        const attachment = loaded.takeAttachment();
+        if (!std.mem.eql(u8, attachment.media_type, "image/png")) return self.fail(label, "image/png", attachment.media_type);
+        const zio = io_mod.getIo();
+        var file = try std.Io.Dir.cwd().openFile(zio, attachment.path, .{});
+        defer file.close(zio);
+        const png = try io_mod.readFileToEnd(self.alloc, &file, 1 << 20);
+        if (png.len < 24 or std.mem.readInt(u32, png[16..20], .big) != 3 or std.mem.readInt(u32, png[20..24], .big) != 2) {
+            return self.fail(label, "a 3x2 png", try std.fmt.allocPrint(self.alloc, "{d} bytes", .{png.len}));
+        }
+        print("ok    {s}", .{label});
+    }
+
     fn startManaged(self: *Smoke, runtime: *managed_execution.Runtime, id: []const u8, command: []const u8, yield_time_ms: u32) !managed_execution.Snapshot {
         var input: managed_execution.StartCapturedInput = .{
             .execution_id = id,
@@ -313,6 +330,10 @@ fn runClipboardChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
         const pasted = try readClipboard(alloc, "(Get-Clipboard -Format FileDropList).FullName");
         if (std.mem.eql(u8, pasted, file)) Smoke.print("ok    clipboard file", .{}) else smoke.fail("clipboard file", file, pasted);
     }
+
+    const bitmap = "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;$b=New-Object Drawing.Bitmap 3,2;[Drawing.Graphics]::FromImage($b).Clear([Drawing.Color]::Red);";
+    try smoke.expectClipboardImage("paste bitmap image", bitmap ++ "[Windows.Forms.Clipboard]::SetImage($b)");
+    try smoke.expectClipboardImage("paste png image", bitmap ++ "$m=New-Object IO.MemoryStream;$b.Save($m,[Drawing.Imaging.ImageFormat]::Png);$d=New-Object Windows.Forms.DataObject;$d.SetData('PNG',$false,$m);[Windows.Forms.Clipboard]::SetDataObject($d,$true)");
     return smoke.failures;
 }
 
