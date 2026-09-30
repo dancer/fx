@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   windows:
-    name: Build & File Smoke
+    name: Build & Smoke
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,5 +26,5 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseSafe
 
-      - name: File tool smoke checks
-        run: zig build windows-file-smoke
+      - name: File and command smoke checks
+        run: zig build windows-smoke

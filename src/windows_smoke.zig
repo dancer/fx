@@ -1,18 +1,26 @@
-//! Native Windows smoke check for the write_file/edit_file pipeline.
+//! Native Windows smoke checks for the write_file/edit_file pipeline and for
+//! command execution.
 //!
 //! The upstream test runner cannot host fx's Windows `Permissions` override,
 //! so this executable drives target resolution, preparation, and apply the way
-//! tool admission does and verifies the bytes on disk. Run it with
-//! `zig build windows-file-smoke` on a Windows host.
+//! tool admission does and verifies the bytes on disk, then runs commands
+//! through the shell `windows_shell` picks. Run it with
+//! `zig build windows-smoke` on a Windows host.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const windows_io = @import("core/shared/windows_io.zig");
+const windows_process = @import("core/shared/windows_process.zig");
 const io_mod = @import("core/shared/io.zig");
 const permissions = @import("core/permissions/permissions.zig");
 const file_mutation = @import("core/tooling/file_mutation.zig");
 const contract = @import("core/tooling/file_mutation_contract.zig");
 const types = @import("core/shared/types.zig");
+const command_runner = @import("core/execution/command_runner.zig");
+const command_contract = @import("core/execution/command_contract.zig");
+const command_environment = @import("core/execution/command_environment.zig");
+const shell_resolver = @import("core/terminal/shell_resolver.zig");
+const windows_shell = @import("core/execution/windows_shell.zig");
 
 pub const std_options_FilePermissions: ?type = if (builtin.os.tag == .windows) windows_io.Permissions else null;
 
@@ -128,30 +136,131 @@ const Smoke = struct {
     fn dupe(self: *Smoke, bytes: []const u8) []u8 {
         return self.alloc.dupe(u8, bytes) catch @panic("OOM");
     }
+
+    fn expectAbsent(self: *Smoke, label: []const u8, relative: []const u8) void {
+        if (self.read(relative)) |content| {
+            return self.fail(label, "no file", content);
+        } else |_| {}
+        print("ok    {s}", .{label});
+    }
+
+    const CommandExpectation = struct {
+        exit_code: ?i64 = 0,
+        contains: []const u8 = "",
+        excludes: []const u8 = "",
+        timeout_ms: ?usize = null,
+        max_duration_ms: u64 = 20_000,
+        environment: command_environment.Environment = .legacy,
+    };
+
+    fn expectCommand(self: *Smoke, label: []const u8, cwd: []const u8, command: []const u8, expected: CommandExpectation) !void {
+        const started_ms = io_mod.milliTimestamp();
+        const outcome = command_runner.executeCommandInEnvironment(.{
+            .max_command_output_bytes = 64 * 1024,
+            .timeout_ms = expected.timeout_ms,
+        }, self.alloc, command, cwd, expected.environment);
+        const duration_ms: u64 = @intCast(@max(0, io_mod.milliTimestamp() - started_ms));
+        if (duration_ms > expected.max_duration_ms) {
+            return self.fail(label, try std.fmt.allocPrint(self.alloc, "under {d} ms", .{expected.max_duration_ms}), try std.fmt.allocPrint(self.alloc, "{d} ms", .{duration_ms}));
+        }
+        const result = outcome catch |err| {
+            if (expected.timeout_ms == null or err != error.TimeoutExpired) return self.fail(label, "a result", @errorName(err));
+            print("ok    {s} ({d} ms)", .{ label, duration_ms });
+            return;
+        };
+        if (expected.timeout_ms != null) return self.fail(label, "TimeoutExpired", result.output);
+        const summary: command_contract.CommandResult = result.command_result orelse .{ .command = command, .cwd = cwd };
+        if (expected.exit_code) |code| {
+            if (summary.exit_code != code) return self.fail(label, try std.fmt.allocPrint(self.alloc, "exit {d}", .{code}), result.output);
+        }
+        if (std.mem.find(u8, result.output, expected.contains) == null) return self.fail(label, expected.contains, result.output);
+        if (expected.excludes.len > 0 and std.mem.find(u8, result.output, expected.excludes) != null) {
+            return self.fail(label, try std.fmt.allocPrint(self.alloc, "no {s}", .{expected.excludes}), result.output);
+        }
+        print("ok    {s} ({d} ms)", .{ label, duration_ms });
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .windows) return error.WindowsOnly;
     io_mod.setIo(init.io);
+    const alloc = init.arena.allocator();
+    io_mod.setRawEnviron(try windows_process.utf8Environ(alloc));
 
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.arena.allocator());
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
     _ = args.next();
     const scratch = args.next() orelse return error.MissingScratchDirectory;
-    const failures = try runChecks(init.arena.allocator(), scratch);
+    const zio = io_mod.getIo();
+    std.Io.Dir.cwd().deleteTree(zio, scratch) catch {};
+    try std.Io.Dir.cwd().createDirPath(zio, scratch);
+    defer std.Io.Dir.cwd().deleteTree(zio, scratch) catch {};
+    const base = try io_mod.realpathAlloc(alloc, scratch);
+
+    var failures: usize = 0;
+    while (args.next()) |group| {
+        if (std.mem.eql(u8, group, "files")) {
+            failures += try runFileChecks(alloc, base);
+        } else if (std.mem.eql(u8, group, "commands")) {
+            failures += try runCommandChecks(alloc, base);
+        } else return error.UnknownCheckGroup;
+    }
     if (failures != 0) {
-        Smoke.print("{d} Windows file smoke check(s) failed", .{failures});
+        Smoke.print("{d} Windows smoke check(s) failed", .{failures});
         std.process.exit(1);
     }
-    Smoke.print("all Windows file smoke checks passed", .{});
+    Smoke.print("all Windows smoke checks passed", .{});
 }
 
-fn runChecks(alloc: std.mem.Allocator, base_arg: []const u8) !usize {
-    const zio = io_mod.getIo();
+fn runCommandChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
+    const shell = try windows_shell.resolve(alloc);
+    Smoke.print("shell {s} {s}", .{ @tagName(shell.kind), shell.path });
+    const spaced = try std.fs.path.join(alloc, &.{ base, "dir with spaces" });
+    try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), spaced);
 
-    std.Io.Dir.cwd().deleteTree(zio, base_arg) catch {};
-    try std.Io.Dir.cwd().createDirPath(zio, base_arg);
-    defer std.Io.Dir.cwd().deleteTree(zio, base_arg) catch {};
-    const base = try io_mod.realpathAlloc(alloc, base_arg);
+    var smoke: Smoke = .{ .alloc = alloc, .root = spaced };
+    var login_shell_buffer: [4096]u8 = undefined;
+    const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
+    const user = try shell_resolver.environment(alloc, configured, .user);
+    const clean = try shell_resolver.environment(alloc, configured, .clean);
+    switch (shell.kind) {
+        .bash => {
+            try smoke.expectCommand("command user profile", spaced, "shopt -q expand_aliases && echo aliases", .{ .contains = "aliases", .environment = user });
+            try smoke.expectCommand("command clean profile", spaced, "echo \"clean $0\"", .{ .contains = "clean", .environment = clean });
+            try smoke.expectCommand("command double quotes", spaced, "echo \"hello   world\"", .{ .contains = "hello   world", .excludes = "\\\"" });
+            try smoke.expectCommand("command single quotes", spaced, "printf '%s|%s\\n' 'a b' \"c\"", .{ .contains = "a b|c" });
+            try smoke.expectCommand("command exit code", spaced, "exit 3", .{ .exit_code = 3 });
+            try smoke.expectCommand("command stderr", spaced, "echo oops >&2; exit 1", .{ .exit_code = 1, .contains = "oops" });
+            try smoke.expectCommand("command utf-8", spaced, "echo \"caf\u{e9} \u{2713}\"", .{ .contains = "caf\u{e9} \u{2713}" });
+            try smoke.expectCommand("command cwd with spaces", spaced, "pwd", .{ .contains = "dir with spaces" });
+            try smoke.expectCommand("command multi-line script", spaced, "for n in 1 2; do\n  echo \"n=$n\"\ndone", .{ .contains = "n=2" });
+            try smoke.expectCommand("command runs git", spaced, "git --version", .{ .contains = "git version" });
+            try smoke.expectCommand("command timeout", spaced, "sleep 3; echo late > timeout-marker", .{ .timeout_ms = 1000, .max_duration_ms = 4000 });
+            try smoke.expectCommand("command background child", spaced, "(sleep 3; echo late > background-marker) & echo started", .{ .contains = "started", .max_duration_ms = 4000 });
+            io_mod.sleep(4 * std.time.ns_per_s);
+            smoke.expectAbsent("timeout stops children", "timeout-marker");
+            smoke.expectAbsent("exit stops background children", "background-marker");
+        },
+        .powershell => {
+            try smoke.expectCommand("command user profile", spaced, "Write-Output \"user\"", .{ .contains = "user", .environment = user });
+            try smoke.expectCommand("command clean profile", spaced, "Write-Output \"clean\"", .{ .contains = "clean", .environment = clean });
+            try smoke.expectCommand("command double quotes", spaced, "Write-Output \"hello   world\"", .{ .contains = "hello   world", .excludes = "\\\"" });
+            try smoke.expectCommand("command exit code", spaced, "exit 3", .{ .exit_code = 3 });
+            try smoke.expectCommand("command native exit code", spaced, "cmd /c exit 5", .{ .exit_code = 5 });
+            try smoke.expectCommand("command cmdlet failure", spaced, "Get-Item missing-item", .{ .exit_code = 1 });
+            try smoke.expectCommand("command stderr", spaced, "[Console]::Error.WriteLine('oops')", .{ .contains = "oops" });
+            try smoke.expectCommand("command utf-8", spaced, "Write-Output \"caf\u{e9} \u{2713}\"", .{ .contains = "caf\u{e9} \u{2713}" });
+            try smoke.expectCommand("command cwd with spaces", spaced, "(Get-Location).Path", .{ .contains = "dir with spaces" });
+            try smoke.expectCommand("command multi-line script", spaced, "foreach ($n in 1, 2) {\n  \"n=$n\"\n}", .{ .contains = "n=2" });
+            try smoke.expectCommand("command timeout", spaced, "cmd /c \"ping -n 4 127.0.0.1 >nul & echo late > timeout-marker\"", .{ .timeout_ms = 1000, .max_duration_ms = 4000 });
+            io_mod.sleep(4 * std.time.ns_per_s);
+            smoke.expectAbsent("timeout stops children", "timeout-marker");
+        },
+    }
+    return smoke.failures;
+}
+
+fn runFileChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
+    const zio = io_mod.getIo();
     const workspace = try std.fs.path.join(alloc, &.{ base, "workspace" });
     const outside = try std.fs.path.join(alloc, &.{ base, "outside" });
     for ([_][]const u8{ workspace, outside, try std.fs.path.join(alloc, &.{ workspace, "lib", "new" }) }) |dir| {

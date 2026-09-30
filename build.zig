@@ -90,22 +90,26 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 
-    const windows_file_smoke = b.addExecutable(.{
-        .name = "windows-file-smoke",
+    const windows_smoke = b.addExecutable(.{
+        .name = "windows-smoke",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/windows_file_smoke.zig"),
+            .root_source_file = b.path("src/windows_smoke.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    const run_windows_file_smoke = b.addRunArtifact(windows_file_smoke);
-    run_windows_file_smoke.addArg(b.pathJoin(&.{ b.cache_root.path orelse ".", "windows-file-smoke" }));
-    const windows_file_smoke_step = b.step(
-        "windows-file-smoke",
-        "Run the native Windows write_file/edit_file smoke checks",
+    const run_windows_smoke = b.addRunArtifact(windows_smoke);
+    run_windows_smoke.addArgs(&.{ b.pathJoin(&.{ b.cache_root.path orelse ".", "windows-smoke" }), "files", "commands" });
+    const run_windows_powershell_smoke = b.addRunArtifact(windows_smoke);
+    run_windows_powershell_smoke.setEnvironmentVariable("FX_WINDOWS_SHELL", "powershell");
+    run_windows_powershell_smoke.addArgs(&.{ b.pathJoin(&.{ b.cache_root.path orelse ".", "windows-smoke-powershell" }), "commands" });
+    const windows_smoke_step = b.step(
+        "windows-smoke",
+        "Run the native Windows file and command smoke checks",
     );
-    windows_file_smoke_step.dependOn(&run_windows_file_smoke.step);
+    windows_smoke_step.dependOn(&run_windows_smoke.step);
+    windows_smoke_step.dependOn(&run_windows_powershell_smoke.step);
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
