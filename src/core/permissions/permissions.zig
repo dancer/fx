@@ -914,7 +914,7 @@ fn boundedResolutionValid(resolution: pathing.BoundedFileTargetResolution) bool 
     if (resolution.relative_components.len == 0) return false;
     if (resolution.relative_components.len > file_mutation_contract.max_file_target_components) return false;
 
-    var expected_start = if (resolution.anchor_path_end == 1)
+    var expected_start = if (std.fs.path.isSep(resolution.canonical_target_path[resolution.anchor_path_end - 1]))
         resolution.anchor_path_end
     else
         resolution.anchor_path_end + 1;
@@ -940,8 +940,8 @@ fn fileTargetRuleDecision(
 }
 
 fn workspaceRelativePermissionPath(workspace_root: []const u8, target_path: []const u8) []const u8 {
-    if (std.mem.eql(u8, workspace_root, target_path)) return ".";
-    if (std.mem.eql(u8, workspace_root, "/")) return target_path[1..];
+    if (target_path.len <= workspace_root.len) return ".";
+    if (std.fs.path.isSep(workspace_root[workspace_root.len - 1])) return target_path[workspace_root.len..];
     return target_path[workspace_root.len + 1 ..];
 }
 
