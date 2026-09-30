@@ -2275,6 +2275,9 @@ fn readImageHeaderFromFile(
 fn normalizePathInput(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, input, " \t\r\n");
     const slice = stripBalancedOuterQuotes(trimmed);
+    // Backslashes separate Windows paths, and its terminals quote dropped
+    // paths instead of escaping them.
+    if (comptime builtin.os.tag == .windows) return alloc.dupe(u8, slice);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
