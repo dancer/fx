@@ -400,11 +400,14 @@ fn runCommandChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
     return smoke.failures;
 }
 
-/// Opens the way editors and Office apps commonly do: others may read and
-/// write, but not delete or rename over the file.
-fn holdWithoutDeleteSharing(alloc: std.mem.Allocator, path: []const u8) !std.os.windows.HANDLE {
+const share_read: std.os.windows.DWORD = 0x1;
+const share_write: std.os.windows.DWORD = 0x2;
+
+/// Holds a file open the way other programs do. Without delete sharing,
+/// nothing can rename over it; without write sharing, nothing can write it.
+fn hold(alloc: std.mem.Allocator, path: []const u8, share: std.os.windows.DWORD) !std.os.windows.HANDLE {
     const wide = try std.unicode.wtf8ToWtf16LeAllocZ(alloc, path);
-    const handle = CreateFileW(wide, 0x80000000, 0x1 | 0x2, null, 3, 0x80, null);
+    const handle = CreateFileW(wide, 0x80000000, share, null, 3, 0x80, null);
     if (handle == std.os.windows.INVALID_HANDLE_VALUE) return error.HoldFailed;
     return handle;
 }
@@ -437,6 +440,7 @@ fn runFileChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
     try smoke.create("crlf-rewrite.txt", "x\r\ny\r\n");
     try smoke.create("held.txt", "held\n");
     try smoke.create("shared.txt", "shared\n");
+    try smoke.create("locked.txt", "locked\n");
     try smoke.create("read-only.txt", "locked\n");
     var read_only = try std.Io.Dir.cwd().openFile(zio, smoke.path("read-only.txt"), .{ .mode = .read_write });
     defer read_only.close(zio);
@@ -469,9 +473,14 @@ fn runFileChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
         try smoke.expectCommitted("edit file held open", smoke.edit("held.txt", "held", "replaced"), "held.txt", "replaced\n");
     }
     {
-        const held = try holdWithoutDeleteSharing(alloc, smoke.path("shared.txt"));
+        const held = try hold(alloc, smoke.path("shared.txt"), share_read | share_write);
         defer std.os.windows.CloseHandle(held);
         try smoke.expectCommitted("edit file held without delete sharing", smoke.edit("shared.txt", "shared", "changed"), "shared.txt", "changed\n");
+    }
+    {
+        const held = try hold(alloc, smoke.path("locked.txt"), share_read);
+        defer std.os.windows.CloseHandle(held);
+        try smoke.expectFailed("edit file locked by another program", smoke.edit("locked.txt", "locked", "open"), "target_locked");
     }
 
     try smoke.expectFailed("edit read-only file", smoke.edit("read-only.txt", "locked", "open"), "io_failure");

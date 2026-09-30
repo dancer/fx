@@ -265,6 +265,7 @@ fn fileMutationRejectionResult(
         .cancelled => "file mutation cancelled before commit",
         .traversal_changed => "file mutation rejected because the approved path traversal changed",
         .staged_source_changed => "file mutation rejected because the staged file changed before commit",
+        .target_locked => "file mutation failed because another program has the file open and locked; ask the user to close it there, then retry",
         .io_failure => "file mutation failed before commit",
     }) catch return error.OutOfMemory;
     if (rejection.created_parent_residue.len > 0) {
@@ -290,6 +291,7 @@ fn fileMutationRejectionResult(
         .status_detail = switch (rejection.reason) {
             .stale_preimage => "stale preview",
             .cancelled => "cancelled",
+            .target_locked => "file locked",
             else => "rejected",
         },
         .failure_kind = switch (rejection.reason) {
@@ -298,7 +300,7 @@ fn fileMutationRejectionResult(
             .binding_mismatch, .traversal_changed, .staged_source_changed, .cancelled => .denied,
             // Authorized work failed at the effect boundary; retry with a
             // fresh preview.
-            .stale_preimage, .io_failure => .apply,
+            .stale_preimage, .target_locked, .io_failure => .apply,
         },
         .model_output = try out.toOwnedSlice(),
     };

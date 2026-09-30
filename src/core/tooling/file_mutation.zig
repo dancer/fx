@@ -51,6 +51,7 @@ pub const ApplyRejectionReason = enum {
     cancelled,
     traversal_changed,
     staged_source_changed,
+    target_locked,
     io_failure,
 };
 
@@ -619,15 +620,16 @@ fn applyWithTestControls(
         commit_parent,
         target_name,
         io_mod.getIo(),
-    ) catch |err| {
-        if (!overwriteHeldTarget(
-            commit_parent,
-            target_name,
-            prepared.policy_targets.items[0].expected_identity,
-            prepared.after_content,
-            err,
-        )) return resources.reject(.io_failure);
-        resources.cleanupTemp();
+    ) catch |err| switch (overwriteHeldTarget(
+        commit_parent,
+        target_name,
+        prepared.policy_targets.items[0].expected_identity,
+        prepared.after_content,
+        err,
+    )) {
+        .rewritten => resources.cleanupTemp(),
+        .locked => return resources.reject(.target_locked),
+        .failed => return resources.reject(.io_failure),
     };
     resources.temp_name = null;
     resources.temp_identity = null;
@@ -642,33 +644,39 @@ fn applyWithTestControls(
 /// without delete sharing, which editors and Office apps commonly do. When
 /// that holder still allows writes, the verified target is rewritten in
 /// place; this gives up atomicity only where the rename was impossible.
+/// A holder that also refuses writes is reported as `.locked`, so the model
+/// can tell the user to close the file rather than retry blindly.
 fn overwriteHeldTarget(
     parent: std.Io.Dir,
     name: []const u8,
     expected_identity: ?file_mutation_contract.FileIdentity,
     content: []const u8,
     rename_error: anyerror,
-) bool {
-    if (comptime builtin.os.tag != .windows) return false;
-    if (rename_error != error.Unexpected and rename_error != error.AccessDenied) return false;
-    const expected = expected_identity orelse return false;
+) HeldTargetOutcome {
+    if (comptime builtin.os.tag != .windows) return .failed;
+    // Zig reports a sharing violation on rename as `error.Unexpected`.
+    const shared = rename_error == error.Unexpected;
+    if (!shared and rename_error != error.AccessDenied) return .failed;
+    const expected = expected_identity orelse return .failed;
     const zio = io_mod.getIo();
     var file = parent.openFile(zio, name, .{
         .mode = .read_write,
         .allow_directory = false,
         .follow_symlinks = false,
         .resolve_beneath = true,
-    }) catch return false;
+    }) catch return if (shared) .locked else .failed;
     defer file.close(zio);
-    const stat = file.stat(zio) catch return false;
-    if (stat.kind != .file) return false;
-    const device = pathing.descriptorDevice(file.handle) catch return false;
-    if (!identityEql(pathing.fileIdentity(device, stat), expected)) return false;
-    file.writePositionalAll(zio, content, 0) catch return false;
-    file.setLength(zio, content.len) catch return false;
-    file.sync(zio) catch return false;
-    return true;
+    const stat = file.stat(zio) catch return .failed;
+    if (stat.kind != .file) return .failed;
+    const device = pathing.descriptorDevice(file.handle) catch return .failed;
+    if (!identityEql(pathing.fileIdentity(device, stat), expected)) return .failed;
+    file.writePositionalAll(zio, content, 0) catch return .failed;
+    file.setLength(zio, content.len) catch return .failed;
+    file.sync(zio) catch return .failed;
+    return .rewritten;
 }
+
+const HeldTargetOutcome = enum { rewritten, locked, failed };
 
 fn preparedCommitClaim(prepared: PreparedFileMutation) *CommitClaim {
     return @ptrCast(@alignCast(prepared.commit_token));
