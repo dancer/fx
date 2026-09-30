@@ -16,6 +16,11 @@
 //! FILE_READ_ATTRIBUTES that stat and length need, while fx verifies files
 //! right after creating them the way POSIX fstat allows. The adapter adds
 //! read access to handles opened for writing.
+//!
+//! Placeholder files: std reports every reparse point that is not a link as
+//! `.unknown`, which covers OneDrive and other cloud-synced files and folders.
+//! They are ordinary entries to every other tool, so the adapter reports the
+//! file or directory kind underneath.
 
 const std = @import("std");
 const windows = std.os.windows;
@@ -86,12 +91,35 @@ fn with_private_mode(stat: std.Io.File.Stat) std.Io.File.Stat {
     return result;
 }
 
+/// Completes a handle stat from its attributes: the kind under a placeholder
+/// reparse point, and READONLY for files. Directories are left writable
+/// because Explorer sets READONLY on customized folders.
+fn with_attributes(handle: windows.HANDLE, stat: std.Io.File.Stat) std.Io.File.Stat {
+    var info: windows.FILE.BASIC_INFORMATION = undefined;
+    var io_status_block: windows.IO_STATUS_BLOCK = undefined;
+    const status = windows.ntdll.NtQueryInformationFile(
+        handle,
+        &io_status_block,
+        &info,
+        @sizeOf(windows.FILE.BASIC_INFORMATION),
+        .Basic,
+    );
+    if (status != .SUCCESS) return with_private_mode(stat);
+    var result = stat;
+    if (result.kind == .unknown) result.kind = if (info.FileAttributes.DIRECTORY) .directory else .file;
+    result = with_private_mode(result);
+    if (result.kind == .file and info.FileAttributes.READONLY) {
+        result.permissions = result.permissions.setReadOnly(true);
+    }
+    return result;
+}
+
 fn file_stat(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
-    return with_private_mode(try inner().fileStat(userdata, file));
+    return with_attributes(file.handle, try inner().fileStat(userdata, file));
 }
 
 fn dir_stat(userdata: ?*anyopaque, dir: std.Io.Dir) std.Io.Dir.StatError!std.Io.Dir.Stat {
-    return with_private_mode(try inner().dirStat(userdata, dir));
+    return with_attributes(dir.handle, try inner().dirStat(userdata, dir));
 }
 
 fn dir_stat_file(
@@ -100,7 +128,11 @@ fn dir_stat_file(
     sub_path: []const u8,
     options: std.Io.Dir.StatFileOptions,
 ) std.Io.Dir.StatFileError!std.Io.File.Stat {
-    return with_private_mode(try inner().dirStatFile(userdata, dir, sub_path, options));
+    const stat = try inner().dirStatFile(userdata, dir, sub_path, options);
+    if (stat.kind != .unknown or options.follow_symlinks) return with_private_mode(stat);
+    var through = options;
+    through.follow_symlinks = true;
+    return with_private_mode(inner().dirStatFile(userdata, dir, sub_path, through) catch stat);
 }
 
 fn dir_open_file(
