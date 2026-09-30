@@ -400,6 +400,9 @@ fn runCommandChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
     return smoke.failures;
 }
 
+const one_pixel_png = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89" ++
+    "\x00\x00\x00\x0d\x49\x44\x41\x54\x78\xda\x63\x64\x60\xf8\x5f\x0f\x00\x02\x87\x01\x80\xeb\x47\xba\x92\x00\x00\x00\x00\x49\x45\x4e\x44\xae\x42\x60\x82";
+
 fn runFileChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
     const zio = io_mod.getIo();
     const workspace = try std.fs.path.join(alloc, &.{ base, "workspace" });
@@ -455,5 +458,21 @@ fn runFileChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
 
     const read_only_content = try smoke.read("read-only.txt");
     if (!std.mem.eql(u8, read_only_content, "locked\n")) smoke.fail("read-only file untouched", "locked\n", read_only_content);
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(zio, notes_abs, .{ .follow_symlinks = false });
+        defer file.close(zio);
+        var buffer: [64]u8 = undefined;
+        var reader = file.readerStreaming(zio, &buffer);
+        if (reader.interface.allocRemaining(alloc, .limited(1024))) |content| {
+            if (std.mem.eql(u8, content, "g\n")) Smoke.print("ok    no-follow streaming read", .{}) else smoke.fail("no-follow streaming read", "g\n", content);
+        } else |err| smoke.fail("no-follow streaming read", "content", @errorName(err));
+    }
+
+    const png_path = smoke.path("pixel.png");
+    try smoke.create("pixel.png", one_pixel_png);
+    if (image_attachments.loadImageAttachment(alloc, png_path)) |attachment| {
+        if (std.mem.eql(u8, attachment.media_type, "image/png")) Smoke.print("ok    attach image by path", .{}) else smoke.fail("attach image by path", "image/png", attachment.media_type);
+    } else |err| smoke.fail("attach image by path", "an attachment", @errorName(err));
     return smoke.failures;
 }

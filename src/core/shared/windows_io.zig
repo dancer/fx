@@ -145,9 +145,37 @@ fn dir_open_file(
     var readable = options;
     if (readable.mode == .write_only) readable.mode = .read_write;
     var file = try inner().dirOpenFile(userdata, dir, sub_path, readable);
-    if (!options.follow_symlinks) file.flags.nonblocking = true;
+    if (options.follow_symlinks) return file;
+    // A no-follow open comes back asynchronous, and asynchronous handles
+    // reject the offset-less reads and writes of streaming I/O. Reopening
+    // the same file object synchronously keeps the no-follow resolution. A
+    // locked open keeps its handle, since the lock belongs to that handle.
+    if (options.lock == .none) {
+        if (reopen_synchronous(file.handle, readable.mode)) |handle| {
+            windows.CloseHandle(file.handle);
+            return .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        }
+    }
+    file.flags.nonblocking = true;
     return file;
 }
+
+fn reopen_synchronous(handle: windows.HANDLE, mode: std.Io.File.OpenMode) ?windows.HANDLE {
+    const access: windows.DWORD = switch (mode) {
+        .read_only => generic_read,
+        .write_only, .read_write => generic_read | generic_write,
+    };
+    const reopened = ReOpenFile(handle, access, file_share_all, file_flag_backup_semantics | file_flag_open_reparse_point);
+    return if (reopened == windows.INVALID_HANDLE_VALUE) null else reopened;
+}
+
+const generic_read: windows.DWORD = 0x80000000;
+const generic_write: windows.DWORD = 0x40000000;
+const file_share_all: windows.DWORD = 0x1 | 0x2 | 0x4;
+const file_flag_backup_semantics: windows.DWORD = 0x02000000;
+const file_flag_open_reparse_point: windows.DWORD = 0x00200000;
+
+extern "kernel32" fn ReOpenFile(original: windows.HANDLE, access: windows.DWORD, share: windows.DWORD, flags: windows.DWORD) callconv(.winapi) windows.HANDLE;
 
 fn dir_create_file(
     userdata: ?*anyopaque,
