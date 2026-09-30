@@ -86,8 +86,12 @@ fn inner() *const std.Io.VTable {
 /// Reports the modes fx's private-state checks expect, since access is
 /// governed by inherited ACLs rather than anything stat can express.
 fn with_private_mode(stat: std.Io.File.Stat) std.Io.File.Stat {
+    return with_mode(stat, if (stat.kind == .directory) 0o700 else 0o600);
+}
+
+fn with_mode(stat: std.Io.File.Stat, mode: std.posix.mode_t) std.Io.File.Stat {
     var result = stat;
-    result.permissions = @enumFromInt(@as(std.posix.mode_t, if (stat.kind == .directory) 0o700 else 0o600));
+    result.permissions = @enumFromInt(mode);
     return result;
 }
 
@@ -107,11 +111,8 @@ fn with_attributes(handle: windows.HANDLE, stat: std.Io.File.Stat) std.Io.File.S
     if (status != .SUCCESS) return with_private_mode(stat);
     var result = stat;
     if (result.kind == .unknown) result.kind = if (info.FileAttributes.DIRECTORY) .directory else .file;
-    result = with_private_mode(result);
-    if (result.kind == .file and info.FileAttributes.READONLY) {
-        result.permissions = result.permissions.setReadOnly(true);
-    }
-    return result;
+    if (result.kind == .file and info.FileAttributes.READONLY) return with_mode(result, 0o400);
+    return with_private_mode(result);
 }
 
 fn file_stat(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
