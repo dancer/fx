@@ -3130,6 +3130,20 @@ test "input escape parser handles ctrl+v csi u sequence" {
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 
+test "input escape parser maps alt+v to the ctrl+v image attach" {
+    var stage: u8 = 1;
+    var param: u16 = 0;
+    var param2: u16 = 0;
+    try std.testing.expectEqual(InputEscapeAction{ .remapped_byte = 22 }, consumeInputEscapeByte(&stage, &param, &param2, 'v').?);
+    try std.testing.expectEqual(@as(u8, 0), stage);
+
+    // ESC[118;3u — Kitty protocol for Alt+V (modifier 3=alt+1)
+    stage = 1;
+    for ("[118;3") |byte| try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, byte));
+    try std.testing.expectEqual(InputEscapeAction{ .remapped_byte = 22 }, consumeInputEscapeByte(&stage, &param, &param2, 'u').?);
+    try std.testing.expectEqual(@as(u8, 0), stage);
+}
+
 test "input escape parser admits raw ctrl+o control byte" {
     try std.testing.expectEqual(
         @as(?InputEscapeAction, .toggle_full_transcript),

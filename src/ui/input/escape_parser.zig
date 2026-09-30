@@ -249,6 +249,7 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
         return .word_right;
     }
     if ((keycode == 'd' or keycode == 'D') and (meta_prefixed or (mods & 0x02) != 0)) return .delete_word_right;
+    if (keycode == 'v' and mods == alt_modifier and !meta_prefixed) return .{ .remapped_byte = 22 };
     if (keycode == 'o' or keycode == 'O') return ctrlOKeyAction(meta_prefixed, mods);
     if ((keycode == 'r' or keycode == 'R') and (mods & 0x08) != 0) return .open_all_sessions;
     if (keycode == 9 and (mods & 0x01) != 0) return .toggle_permission_mode;
@@ -542,6 +543,14 @@ pub fn consumeInputEscapeByteWithMouse(
                 param.* = 0;
                 param2.* = 0;
                 return .{ .composer_shortcut = .delete_word_right };
+            }
+            if (byte == 'v') {
+                stage.* = 0;
+                param.* = 0;
+                param2.* = 0;
+                // Meta-V attaches a clipboard image like Ctrl+V, for terminals
+                // that keep Ctrl+V as their own text paste.
+                return .{ .remapped_byte = 22 };
             }
             if (byte == 0x7f or byte == 0x08) {
                 stage.* = 0;
