@@ -242,7 +242,11 @@ fn loadResolvedImageAttachment(
 }
 
 pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
-    const temp_root = try io_mod.realpathAlloc(alloc, "/tmp");
+    const temp_base = if (comptime builtin.os.tag == .windows)
+        io_mod.getenv("TMPDIR") orelse return error.FileNotFound
+    else
+        "/tmp";
+    const temp_root = try io_mod.realpathAlloc(alloc, temp_base);
     defer alloc.free(temp_root);
     for (0..16) |_| {
         var suffix: u64 = undefined;

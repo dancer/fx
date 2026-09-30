@@ -430,9 +430,11 @@ pub fn setRawEnviron(raw: RawEnviron) void {
 
 pub fn getenv(key: []const u8) ?[]const u8 {
     // Windows names the home directory USERPROFILE and rarely sets HOME, so
-    // resolve HOME the way Git for Windows does.
+    // resolve HOME the way Git for Windows does. Its temporary directory is
+    // TEMP or TMP, and there is no /tmp to fall back on.
     if (comptime builtin.os.tag == .windows) {
         if (std.mem.eql(u8, key, "HOME")) return lookupEnv("HOME") orelse lookupEnv("USERPROFILE");
+        if (std.mem.eql(u8, key, "TMPDIR")) return lookupEnv("TMPDIR") orelse lookupEnv("TEMP") orelse lookupEnv("TMP");
     }
     return lookupEnv(key);
 }
