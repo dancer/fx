@@ -110,6 +110,12 @@ pub fn build(b: *std.Build) void {
     );
     windows_smoke_step.dependOn(&run_windows_smoke.step);
     windows_smoke_step.dependOn(&run_windows_powershell_smoke.step);
+    const run_windows_clipboard_smoke = b.addRunArtifact(windows_smoke);
+    run_windows_clipboard_smoke.addArgs(&.{ b.pathJoin(&.{ b.cache_root.path orelse ".", "windows-smoke-clipboard" }), "clipboard" });
+    b.step(
+        "windows-smoke-clipboard",
+        "Round-trip text and files through the Windows clipboard, restoring its text afterwards",
+    ).dependOn(&run_windows_clipboard_smoke.step);
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);

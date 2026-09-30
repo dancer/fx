@@ -25,6 +25,7 @@ const shell_resolver = @import("core/terminal/shell_resolver.zig");
 const windows_shell = @import("core/execution/windows_shell.zig");
 const http_fetch = @import("tools/web/http_fetch.zig");
 const url_policy = @import("tools/web/url_policy.zig");
+const windows_clipboard = @import("core/hosts/windows_clipboard.zig");
 
 pub const std_options_FilePermissions: ?type = if (builtin.os.tag == .windows) windows_io.Permissions else null;
 
@@ -278,6 +279,8 @@ pub fn main(init: std.process.Init) !void {
             try smoke.expectFetch("fetch http redirect to https", "http://github.com/", "https://github.com", false);
             try smoke.expectFetch("fetch cancelled", "https://github.com/", "", true);
             failures += smoke.failures;
+        } else if (std.mem.eql(u8, group, "clipboard")) {
+            failures += try runClipboardChecks(alloc, base);
         } else return error.UnknownCheckGroup;
     }
     if (failures != 0) {
@@ -285,6 +288,39 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
     Smoke.print("all Windows smoke checks passed", .{});
+}
+
+/// Replaces the clipboard while it runs, so it is opt-in rather than part of
+/// the default groups. The text that was on the clipboard is put back.
+fn runClipboardChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
+    var smoke: Smoke = .{ .alloc = alloc, .root = base };
+    const saved = try readClipboard(alloc, "Get-Clipboard -Raw");
+    defer _ = windows_clipboard.copyText(saved);
+
+    const text = "fx clipboard caf\u{e9} \u{2713}\nline two";
+    if (!windows_clipboard.copyText(text)) {
+        smoke.fail("clipboard text", "copied", "copy failed");
+    } else {
+        const pasted = try readClipboard(alloc, "Get-Clipboard -Raw");
+        if (std.mem.eql(u8, pasted, "fx clipboard caf\u{e9} \u{2713}\r\nline two")) Smoke.print("ok    clipboard text", .{}) else smoke.fail("clipboard text", text, pasted);
+    }
+
+    try smoke.create("clipboard file.txt", "trace");
+    const file = smoke.path("clipboard file.txt");
+    if (!windows_clipboard.copyFile(file)) {
+        smoke.fail("clipboard file", "copied", "copy failed");
+    } else {
+        const pasted = try readClipboard(alloc, "(Get-Clipboard -Format FileDropList).FullName");
+        if (std.mem.eql(u8, pasted, file)) Smoke.print("ok    clipboard file", .{}) else smoke.fail("clipboard file", file, pasted);
+    }
+    return smoke.failures;
+}
+
+fn readClipboard(alloc: std.mem.Allocator, expression: []const u8) ![]const u8 {
+    const script = try std.fmt.allocPrint(alloc, "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);{s}", .{expression});
+    const result = try std.process.run(alloc, io_mod.getIo(), .{ .argv = &.{ "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script } });
+    if (result.term != .exited or result.term.exited != 0) return error.ClipboardReadFailed;
+    return if (std.mem.endsWith(u8, result.stdout, "\r\n")) result.stdout[0 .. result.stdout.len - 2] else result.stdout;
 }
 
 fn runCommandChecks(alloc: std.mem.Allocator, base: []const u8) !usize {
