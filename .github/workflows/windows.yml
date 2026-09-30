@@ -1,0 +1,30 @@
+name: Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Build & File Smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+          cache-key: windows
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: File tool smoke checks
+        run: zig build windows-file-smoke
