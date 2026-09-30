@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const contracts = @import("contracts.zig");
 const command_environment = @import("../execution/command_environment.zig");
+const windows_shell = @import("../execution/windows_shell.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -103,7 +104,11 @@ pub fn resolve(
 }
 
 pub fn configuredLoginShellInto(buffer: []u8) ?[]const u8 {
-    if (comptime !builtin.link_libc or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.os.tag == .windows) {
+        var fixed = std.heap.FixedBufferAllocator.init(buffer);
+        return (windows_shell.resolve(fixed.allocator()) catch return null).path;
+    }
+    if (comptime !builtin.link_libc or builtin.os.tag == .wasi) {
         return null;
     }
     var entry: std.c.passwd = undefined;
@@ -130,6 +135,15 @@ pub fn environment(
     profile: ?Profile,
 ) (ResolveError || Allocator.Error)!Environment {
     const selected = profile orelse .user;
+    // Windows runs captured commands through `windows_shell`, which is not
+    // limited to Bash and zsh.
+    if (comptime builtin.os.tag == .windows) {
+        const path = configured_login_shell orelse return error.MissingLoginShell;
+        return switch (selected) {
+            .clean => .{ .clean = try alloc.dupe(u8, path) },
+            .user => .{ .user = try alloc.dupe(u8, path) },
+        };
+    }
     const path = try supportedLoginShell(configured_login_shell);
     _ = try resolve(null, switch (selected) {
         .clean => .{ .executable = .{ .path = path, .clean_start = true } },

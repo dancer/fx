@@ -8,6 +8,7 @@ const pathing = @import("../core/workspace/pathing.zig");
 const session_runtime = @import("../core/session/session.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const types = @import("../core/shared/types.zig");
+const windows_shell = @import("../core/execution/windows_shell.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
 const context_limits = @import("../core/config/context_limits.zig");
 const prompt_policy_contract = @import("../core/config/prompt_policy.zig");
@@ -2110,7 +2111,7 @@ fn buildTurnContextFragment(arena: Allocator, workspace_root: []const u8) ![]con
     const cwd = currentWorkingDirectory(arena) catch "(unavailable)";
     const os_text = try host.operatingSystemText(arena);
     const date_text = try todayUtcText(arena);
-    const shell = shellPath() orelse "(unknown)";
+    const shell = shellPath(arena) orelse "(unknown)";
     const home = homeDir() orelse "(unknown)";
     const git = collectGitInfo(arena, workspace_root) catch GitInfo{};
 
@@ -2184,7 +2185,10 @@ fn currentWorkingDirectory(arena: Allocator) ![]const u8 {
     return std.process.currentPathAlloc(io_mod.getIo(), arena);
 }
 
-fn shellPath() ?[]const u8 {
+fn shellPath(arena: Allocator) ?[]const u8 {
+    if (comptime @import("builtin").os.tag == .windows) {
+        return (windows_shell.resolve(arena) catch return null).path;
+    }
     return io_mod.getenv("SHELL") orelse io_mod.getenv("COMSPEC");
 }
 

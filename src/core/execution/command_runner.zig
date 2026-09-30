@@ -14,6 +14,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
+const windows_shell = @import("windows_shell.zig");
 
 const Allocator = std.mem.Allocator;
 pub const CommandOutputStream = command_contract.CommandOutputStream;
@@ -683,6 +684,13 @@ pub fn executeCommandInEnvironment(
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     try ExecutionControl.init(effective_cfg).check();
+    if (comptime builtin.os.tag == .windows) {
+        return switch (environment) {
+            .clean => |path| executeWindowsShell(arena, scratch, effective_cfg, command, command, cwd, windows_shell.fromPath(path), .clean),
+            .user => |path| executeWindowsShell(arena, scratch, effective_cfg, command, command, cwd, windows_shell.fromPath(path), .user),
+            .legacy, .workspace_clean => unreachable,
+        };
+    }
     const invocation = try shell_resolver.capturedInvocation(scratch, environment, command);
     debug_trace.logf(
         "core",
@@ -1631,9 +1639,8 @@ fn executeRawBashWithResultCommand(
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
     if (builtin.os.tag == .windows) {
-        const argv = [_][]const u8{ "cmd", "/C", execution_command };
-        const result = try executeProcess(scratch, cfg, &argv, cwd);
-        return formatCollectedOutput(alloc, result_command, cwd, result);
+        const shell = try windows_shell.resolve(scratch);
+        return executeWindowsShell(alloc, scratch, cfg, execution_command, result_command, cwd, shell, .user);
     }
 
     const argv = [_][]const u8{
@@ -1648,6 +1655,33 @@ fn executeRawBashWithResultCommand(
         cwd,
         execution_command,
     );
+    return formatCollectedOutput(alloc, result_command, cwd, result);
+}
+
+/// Runs the script from stdin like the POSIX launcher. The profile picks
+/// whether Bash loads the user's startup files, as it does for the captured
+/// POSIX invocations.
+fn executeWindowsShell(
+    alloc: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    execution_command: []const u8,
+    result_command: []const u8,
+    cwd: []const u8,
+    shell: windows_shell.Shell,
+    profile: command_environment.Profile,
+) !command_contract.RunCommandResult {
+    const user_argv = [_][]const u8{ shell.path, "--login", "-O", "expand_aliases", "-c", script_from_stdin_launcher };
+    const clean_argv = [_][]const u8{ shell.path, "--noprofile", "--norc", "-c", script_from_stdin_launcher };
+    const powershell_argv = windows_shell.powershellArgv(shell.path);
+    const argv: []const []const u8 = switch (shell.kind) {
+        .bash => switch (profile) {
+            .user => &user_argv,
+            .clean => &clean_argv,
+        },
+        .powershell => &powershell_argv,
+    };
+    const result = try executeProcessWithScript(scratch, cfg, argv, cwd, execution_command);
     return formatCollectedOutput(alloc, result_command, cwd, result);
 }
 
