@@ -90,6 +90,23 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 
+    const windows_file_smoke = b.addExecutable(.{
+        .name = "windows-file-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/windows_file_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_windows_file_smoke = b.addRunArtifact(windows_file_smoke);
+    run_windows_file_smoke.addArg(b.pathJoin(&.{ b.cache_root.path orelse ".", "windows-file-smoke" }));
+    const windows_file_smoke_step = b.step(
+        "windows-file-smoke",
+        "Run the native Windows write_file/edit_file smoke checks",
+    );
+    windows_file_smoke_step.dependOn(&run_windows_file_smoke.step);
+
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
     }
